@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Blackjack Strategy Lab</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-primary: #0a0c12;
+    --bg-card: #10121a;
+    --bg-elevated: #161822;
+    --border: #1e2130;
+    --border-hover: #2d3048;
+    --text-primary: #e2e4ea;
+    --text-secondary: #888a96;
+    --text-muted: #555766;
+    --gold: #d4a843;
+    --gold-dim: rgba(212,168,67,0.15);
+    --green: #66bb6a;
+    --red: #ef5350;
+    --font-mono: 'Space Mono', monospace;
+    --font-sans: 'Outfit', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ── Header ── */
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 28px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap; gap: 12px;
+  }
+  .header-left { display: flex; align-items: baseline; gap: 14px; }
+  .header-left .logo {
+    font: 700 14px var(--font-mono);
+    color: var(--gold);
+    letter-spacing: 3px;
+  }
+  .header-left h1 {
+    font: 600 20px var(--font-sans);
+    letter-spacing: -0.03em;
+    color: var(--text-primary);
+  }
+  .header-right { display: flex; gap: 8px; align-items: center; }
+
+  .btn {
+    padding: 8px 20px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-muted);
+    font: 400 12px var(--font-mono);
+    cursor: pointer;
+    letter-spacing: 0.5px;
+    transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--border-hover); color: var(--text-secondary); }
+  .btn.active {
+    background: var(--bg-elevated);
+    border-color: var(--border-hover);
+    color: var(--text-primary);
+    font-weight: 700;
+  }
+  .btn-gold {
+    background: linear-gradient(135deg, var(--gold), #b8912e);
+    color: var(--bg-primary);
+    border: none;
+    font-weight: 700;
+    letter-spacing: 1px;
+  }
+  .btn-gold:hover { filter: brightness(1.1); }
+  .btn-gold:disabled { opacity: 0.4; cursor: not-allowed; filter: none; }
+
+  /* ── Layout ── */
+  .app { display: flex; height: calc(100vh - 57px); }
+  .sidebar {
+    width: 270px; min-width: 250px;
+    border-right: 1px solid var(--border);
+    padding: 16px 14px;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+  .main { flex: 1; padding: 20px 24px; overflow-y: auto; min-width: 0; }
+
+  /* ── Sidebar sections ── */
+  .section-title {
+    font: 400 10px var(--font-mono);
+    letter-spacing: 2px;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+  }
+  .section { margin-bottom: 20px; }
+
+  .strategy-btn {
+    width: 100%; text-align: left;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 5px;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .strategy-btn.active { background: var(--bg-card); }
+  .strategy-btn .dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    margin-right: 8px;
+    vertical-align: middle;
+    transition: background 0.12s;
+  }
+  .strategy-btn .label {
+    font: 500 13px var(--font-sans);
+    color: var(--text-muted);
+    vertical-align: middle;
+  }
+  .strategy-btn.active .label { color: var(--text-primary); }
+  .strategy-btn .desc {
+    display: none;
+    font: 300 11px var(--font-sans);
+    color: var(--text-muted);
+    margin-top: 5px;
+    margin-left: 18px;
+    line-height: 1.4;
+  }
+  .strategy-btn.active .desc { display: block; }
+
+  /* ── Charts ── */
+  .chart-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    box-shadow: 0 0 40px rgba(212,168,67,0.04);
+  }
+  .chart-header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 14px;
+    flex-wrap: wrap; gap: 8px;
+  }
+  .chart-label {
+    font: 400 11px var(--font-mono);
+    color: var(--text-muted);
+    letter-spacing: 1px;
+  }
+
+  .axis text { fill: var(--text-muted); font: 11px var(--font-mono); }
+  .axis line, .axis path { stroke: var(--border); }
+  .grid line { stroke: var(--border); stroke-dasharray: 3,3; }
+  .grid path { stroke: none; }
+
+  .tooltip-box {
+    position: absolute;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-hover);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font: 11px var(--font-mono);
+    color: var(--text-secondary);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+    z-index: 100;
+    white-space: nowrap;
+  }
+
+  /* ── Stats table ── */
+  .stats-table {
+    width: 100%;
+    border-collapse: collapse;
+    font: 12px var(--font-mono);
+    margin-top: 16px;
+  }
+  .stats-table th {
+    text-align: right;
+    padding: 8px 10px;
+    color: var(--text-muted);
+    font-weight: 400;
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border-hover);
+  }
+  .stats-table th:first-child { text-align: left; }
+  .stats-table td {
+    text-align: right;
+    padding: 10px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+  .stats-table td:first-child { text-align: left; color: #ccc; }
+
+  /* ── Live mode ── */
+  .live-panel {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .live-controls {
+    display: flex; gap: 8px; align-items: center;
+    margin-bottom: 16px; flex-wrap: wrap;
+  }
+  .speed-slider {
+    -webkit-appearance: none;
+    background: var(--bg-elevated);
+    height: 4px; border-radius: 2px;
+    outline: none; width: 100px;
+  }
+  .speed-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: var(--gold);
+    cursor: pointer;
+  }
+
+  .cards-display { display: flex; gap: 24px; margin: 14px 0; flex-wrap: wrap; }
+  .card-group h4 {
+    font: 400 10px var(--font-mono);
+    color: var(--text-muted);
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+  }
+  .card-row { display: flex; gap: 4px; }
+  .playing-card {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 38px; height: 52px;
+    background: #f0ece4;
+    border-radius: 4px;
+    font: 700 14px var(--font-mono);
+    color: #222;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  }
+  .playing-card.red { color: #c62828; }
+
+  .live-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 10px;
+    margin-top: 14px;
+  }
+  .live-stat {
+    background: var(--bg-elevated);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .live-stat .val {
+    font: 700 18px var(--font-mono);
+    color: var(--text-primary);
+  }
+  .live-stat .lbl {
+    font: 300 10px var(--font-sans);
+    color: var(--text-muted);
+    letter-spacing: 0.5px;
+    margin-top: 2px;
+  }
+
+  /* ── Legend ── */
+  .legend {
+    display: flex; gap: 16px; justify-content: center;
+    margin-top: 12px; flex-wrap: wrap;
+  }
+  .legend-item {
+    display: flex; align-items: center; gap: 6px;
+    font: 11px var(--font-mono);
+    color: var(--text-secondary);
+  }
+  .legend-swatch {
+    width: 14px; height: 3px;
+    border-radius: 1px;
+  }
+
+  /* ── Distribution buttons ── */
+  .dist-buttons { display: flex; gap: 4px; flex-wrap: wrap; }
+  .dist-btn {
+    padding: 4px 12px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font: 11px var(--font-mono);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .dist-btn.active { font-weight: 700; }
+
+  /* ── Empty state ── */
+  .empty-state {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    height: 60vh; gap: 16px;
+  }
+  .empty-state .suits { font-size: 48px; opacity: 0.12; }
+  .empty-state p {
+    font: 14px var(--font-mono);
+    color: var(--text-muted);
+  }
+
+  /* ── Slider rows (settings) ── */
+  .setting-row {
+    margin-bottom: 10px;
+  }
+  .setting-row .row-top {
+    display: flex; justify-content: space-between; margin-bottom: 3px;
+  }
+  .setting-row .row-top .lbl { font: 12px var(--font-sans); color: var(--text-secondary); }
+  .setting-row .row-top .val {
+    font: 700 12px var(--font-mono);
+    color: var(--gold);
+  }
+  .setting-row input[type=range] {
+    -webkit-appearance: none; width: 100%;
+    background: var(--bg-elevated); height: 4px;
+    border-radius: 2px; outline: none;
+  }
+  .setting-row input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px; height: 14px;
+    border-radius: 50%; background: var(--gold);
+    cursor: pointer;
+  }
+  .toggle-row {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 10px;
+  }
+  .toggle-row .lbl { font: 12px var(--font-sans); color: var(--text-secondary); }
+  .toggle-group { display: flex; gap: 2px; }
+  .toggle-opt {
+    padding: 3px 10px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font: 11px var(--font-mono);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .toggle-opt.active {
+    background: var(--gold-dim);
+    border-color: var(--gold);
+    color: var(--gold);
+  }
+
+  .strategy-selector {
+    display: flex; gap: 4px; margin-bottom: 10px;
+  }
+  .strategy-selector .btn { padding: 4px 10px; font-size: 11px; }
+
+  @media (max-width: 800px) {
+    .app { flex-direction: column; height: auto; }
+    .sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <span class="logo">21</span>
+    <h1>Blackjack Strategy Lab</h1>
+  </div>
+  <div class="header-right">
+    <button class="btn active" id="tab-bankroll" onclick="switchTab('bankroll')">BANKROLL</button>
+    <button class="btn" id="tab-distribution" onclick="switchTab('distribution')">DISTRIBUTION</button>
+    <button class="btn" id="tab-stats" onclick="switchTab('stats')">STATS</button>
+    <button class="btn" id="tab-live" onclick="switchTab('live')">LIVE</button>
+    <button class="btn btn-gold" id="run-btn" onclick="runSimulation()">RUN SIMULATION</button>
+  </div>
+</div>
+
+<div class="app">
+  <div class="sidebar">
+    <div class="section">
+      <div class="section-title">TABLE RULES</div>
+      <div id="settings-container"></div>
+    </div>
+    <div class="section">
+      <div class="section-title">SIMULATION</div>
+      <div id="sim-settings-container"></div>
+    </div>
+    <div class="section">
+      <div class="section-title">BETTING STRATEGIES</div>
+      <div id="strategies-container"></div>
+    </div>
+  </div>
+  <div class="main" id="main-content">
+    <div class="empty-state" id="empty-state">
+      <div class="suits">♠ ♥ ♦ ♣</div>
+      <p>Configure settings & hit RUN SIMULATION</p>
+    </div>
+    <div id="view-bankroll" style="display:none;"></div>
+    <div id="view-distribution" style="display:none;"></div>
+    <div id="view-stats" style="display:none;"></div>
+    <div id="view-live" style="display:none;"></div>
+  </div>
+</div>
+
+<div class="tooltip-box" id="tooltip"></div>
+
+<script>
+// ══════════════════════════════════════════════════════════════════════════════
+// CONFIG & STATE
+// ══════════════════════════════════════════════════════════════════════════════
+
+const STRATEGIES = {
+  flat:            { name: "Flat Bet",   color: "#4fc3f7", desc: "Bet the same amount every hand. The control group." },
+  martingale:      { name: "Martingale", color: "#ef5350", desc: "Double after every loss, reset after a win." },
+  paroli:          { name: "Paroli",     color: "#66bb6a", desc: "Double after a win (3-win cap), reset on a loss." },
+  oneThreeTwoSix:  { name: "1-3-2-6",   color: "#ffa726", desc: "Bet 1→3→2→6 units on consecutive wins." },
+  oscar:           { name: "Oscar's Grind", color: "#ab47bc", desc: "Raise by 1 unit after a win; reset when cycle profits 1 unit." },
+  hilo:            { name: "Hi-Lo Count",   color: "#26c6da", desc: "Bet proportional to the Hi-Lo true count." },
+};
+
+const HILO_TAGS = {2:1,3:1,4:1,5:1,6:1,7:0,8:0,9:0,10:-1,J:-1,Q:-1,K:-1,A:-1};
+
+let state = {
+  settings: { decks:6, penetration:75, tableMin:25, tableMax:5000, bjPays:"3:2", dealerS17:true },
+  sim: { bankroll:10000, hands:2000, sims:50 },
+  activeStrategies: new Set(["flat","martingale","hilo"]),
+  results: null,
+  currentTab: "bankroll",
+  liveState: { playing: false, timer: null, speed: 50, handIdx: 0, strategy: "flat" },
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CARD ENGINE (mirrors Python logic)
+// ══════════════════════════════════════════════════════════════════════════════
+
+const RANKS = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"];
+
+function cardVal(r) { if(r==="A") return 11; if(["K","Q","J","10"].includes(r)) return 10; return +r; }
+function handTotal(cards) {
+  let t=0,a=0;
+  for(const c of cards){t+=cardVal(c);if(c==="A")a++;}
+  while(t>21&&a>0){t-=10;a--;}
+  return t;
+}
+function isSoft(cards){let t=0,a=0;for(const c of cards){t+=cardVal(c);if(c==="A")a++;}while(t>21&&a>0){t-=10;a--;}return a>0&&t<=21;}
+
+function createShoe(n){
+  const cards=[];
+  for(let d=0;d<n;d++) for(const r of RANKS) for(let s=0;s<4;s++) cards.push(r);
+  for(let i=cards.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[cards[i],cards[j]]=[cards[j],cards[i]];}
+  return {cards, idx:0, cut:Math.floor(cards.length*state.settings.penetration/100)};
+}
+
+function shoeDeal(shoe){return shoe.cards[shoe.idx++];}
+function shoeNeedsReshuffle(shoe){return shoe.idx>=shoe.cut;}
+function shoeDecksRemaining(shoe){return Math.max(0.5,(shoe.cards.length-shoe.idx)/52);}
+
+function basicStrategy(cards, dealerUp, canDouble, canSplit){
+  const pt=handTotal(cards),dv=cardVal(dealerUp),soft=isSoft(cards);
+  if(canSplit&&cards.length===2&&cards[0]===cards[1]){
+    const pv=cardVal(cards[0]);
+    if(pv===11||pv===8) return "split";
+    if(pv===9&&dv>=2&&dv<=6) return "split";
+    if(pv===7&&dv>=2&&dv<=7) return "split";
+    if(pv===6&&dv>=2&&dv<=6) return "split";
+    if((pv===2||pv===3)&&dv>=2&&dv<=7) return "split";
+    if(pv===4&&(dv===5||dv===6)) return "split";
+  }
+  if(soft){
+    if(pt>=19) return "stand";
+    if(pt===18){if(dv>=9) return "hit";if(dv>=3&&dv<=6&&canDouble) return "double";return "stand";}
+    if(pt===17&&dv>=3&&dv<=6&&canDouble) return "double";
+    if((pt===15||pt===16)&&dv>=4&&dv<=6&&canDouble) return "double";
+    if((pt===13||pt===14)&&dv>=5&&dv<=6&&canDouble) return "double";
+    return "hit";
+  }
+  if(pt>=17) return "stand";
+  if(pt>=13&&pt<=16&&dv>=2&&dv<=6) return "stand";
+  if(pt===12&&dv>=4&&dv<=6) return "stand";
+  if(pt===11&&canDouble) return "double";
+  if(pt===10&&dv<=9&&canDouble) return "double";
+  if(pt===9&&dv>=3&&dv<=6&&canDouble) return "double";
+  return "hit";
+}
+
+function playHand(shoe){
+  const p=[shoeDeal(shoe),shoeDeal(shoe)], d=[shoeDeal(shoe),shoeDeal(shoe)];
+  const allCards=[...p,...d], dealerUp=d[0];
+  let pt=handTotal(p),dt=handTotal(d);
+  if(pt===21){return {net:dt===21?0:1.5,pCards:[...p],dCards:[...d],pt,dt,bj:dt!==21,allCards};}
+  if(dt===21){return {net:-1,pCards:[...p],dCards:[...d],pt,dt,bj:false,allCards};}
+  function playP(cards,canSplit){
+    let action=basicStrategy(cards,dealerUp,cards.length===2,canSplit);
+    if(action==="split"&&canSplit){
+      const h1=[cards[0],shoeDeal(shoe)],h2=[cards[1],shoeDeal(shoe)];
+      allCards.push(h1[1],h2[1]);
+      return [...playP(h1,false),...playP(h2,false)];
+    }
+    let doubled=false;
+    while(true){
+      action=basicStrategy(cards,dealerUp,cards.length===2&&!doubled,false);
+      if(action==="stand") break;
+      if(action==="double"){const c=shoeDeal(shoe);cards.push(c);allCards.push(c);doubled=true;break;}
+      const c=shoeDeal(shoe);cards.push(c);allCards.push(c);
+      if(handTotal(cards)>21) break;
+    }
+    return [{cards,doubled,total:handTotal(cards)}];
+  }
+  const pHands=playP([...p],true);
+  const anyAlive=pHands.some(h=>h.total<=21);
+  if(anyAlive){while(true){dt=handTotal(d);if(dt>17||(dt===17&&(state.settings.dealerS17||!isSoft(d)))) break;const c=shoeDeal(shoe);d.push(c);allCards.push(c);}dt=handTotal(d);}
+  let net=0;
+  for(const h of pHands){const m=h.doubled?2:1;if(h.total>21)net-=m;else if(dt>21)net+=m;else if(h.total>dt)net+=m;else if(h.total<dt)net-=m;}
+  return {net,pCards:pHands.length===1?pHands[0].cards:pHands.flatMap(h=>h.cards),dCards:d,pt:pHands.length===1?pHands[0].total:0,dt,bj:false,doubled:pHands.some(h=>h.doubled),allCards};
+}
+
+// ── Betting strategy state machines ──
+function initBet(key){
+  switch(key){
+    case "flat": return {};
+    case "martingale": return {losses:0};
+    case "paroli": return {wins:0};
+    case "oneThreeTwoSix": return {step:0};
+    case "oscar": return {bet:1,profit:0};
+    case "hilo": return {rc:0};
+  }
+}
+function getBet(key,bs,tmin){
+  switch(key){
+    case "flat": return tmin;
+    case "martingale": return tmin*Math.pow(2,bs.losses);
+    case "paroli": return tmin*Math.pow(2,bs.wins);
+    case "oneThreeTwoSix": return tmin*[1,3,2,6][bs.step];
+    case "oscar": return tmin*bs.bet;
+    case "hilo": {const tc=bs.rc/Math.max(1,bs._dr||4);if(tc<=1)return tmin;if(tc<=2)return tmin*2;if(tc<=3)return tmin*4;if(tc<=4)return tmin*8;return tmin*12;}
+  }
+}
+function updateBet(key,bs,won,allCards){
+  switch(key){
+    case "flat": return bs;
+    case "martingale": return {losses:won?0:bs.losses+1};
+    case "paroli": {let w=won?Math.min(bs.wins+1,2):0;if(bs.wins>=2&&won)w=0;return {wins:w};}
+    case "oneThreeTwoSix": return {step:won?Math.min(bs.step+1,3):0};
+    case "oscar": {let nb=bs.bet,np=bs.profit;if(won){np+=bs.bet;nb=bs.bet+1;}else{np-=bs.bet;}if(np>=1)return{bet:1,profit:0};return{bet:Math.max(1,nb),profit:np};}
+    case "hilo": {let rc=bs.rc;if(allCards) for(const c of allCards) rc+=(HILO_TAGS[c]||0);return{rc};}
+  }
+}
+
+// ── Full simulation ──
+function simulate(sKey, recordHands){
+  const {decks,penetration,tableMin,tableMax,bjPays}=state.settings;
+  const {bankroll:startB,hands:numH}=state.sim;
+  let shoe=createShoe(decks), bankroll=startB, maxB=startB, maxDD=0, ruined=false;
+  let bs=initBet(sKey);
+  const bjMult=bjPays==="3:2"?1.5:1.2;
+  const sampleInterval=Math.max(1,Math.floor(numH/800));
+  const history=[{hand:0,bankroll}];
+  const hands=[];
+  let wins=0,losses=0,pushes=0,bjs=0;
+
+  for(let h=0;h<numH;h++){
+    if(shoeNeedsReshuffle(shoe)){shoe=createShoe(decks);if(sKey==="hilo")bs={rc:0};}
+    if(bankroll<=0){ruined=true;break;}
+    if(shoe.cards.length-shoe.idx<15){shoe=createShoe(decks);if(sKey==="hilo")bs={rc:0};}
+    if(sKey==="hilo") bs._dr=shoeDecksRemaining(shoe);
+    let rawBet=getBet(sKey,bs,tableMin);
+    let bet=Math.min(Math.max(rawBet,tableMin),tableMax,bankroll);
+    const r=playHand(shoe);
+    const payout=r.bj&&r.net>0?bet*bjMult:r.net*bet;
+    bankroll=Math.round((bankroll+payout)*100)/100;
+    maxB=Math.max(maxB,bankroll);
+    const dd=maxB>0?(maxB-bankroll)/maxB:0;
+    maxDD=Math.max(maxDD,dd);
+    const won=r.net>0;
+    let label="push";
+    if(r.net>0){if(r.bj){bjs++;label="blackjack";}else{wins++;label="win";}}
+    else if(r.net<0){losses++;label="loss";}else{pushes++;}
+    bs=updateBet(sKey,bs,won,r.allCards);
+    if(h%sampleInterval===0||h===numH-1) history.push({hand:h+1,bankroll});
+    if(recordHands) hands.push({hand_num:h+1,bankroll,bet:Math.round(bet*100)/100,net:Math.round(payout*100)/100,
+      player_cards:r.pCards,dealer_cards:r.dCards,player_total:r.pt,dealer_total:r.dt,result:label,
+      running_count:sKey==="hilo"?bs.rc:undefined,true_count:sKey==="hilo"?Math.round(bs.rc/shoeDecksRemaining(shoe)*100)/100:undefined});
+  }
+  const total=wins+losses+pushes+bjs;
+  return {history,hands,final_bankroll:bankroll,max_drawdown:Math.round(maxDD*1e4)/1e4,ruined,
+    stats:{total_hands:total,wins,losses,pushes,blackjacks:bjs,win_rate:Math.round((wins+bjs)/Math.max(total,1)*1e4)/1e4}};
+}
+
+function runSimulation(){
+  const btn=document.getElementById("run-btn");
+  btn.disabled=true; btn.textContent="SIMULATING...";
+  setTimeout(()=>{
+    const results={};
+    for(const sKey of state.activeStrategies){
+      const sims=[];
+      let liveHands=[];
+      for(let i=0;i<state.sim.sims;i++){
+        const r=simulate(sKey,i===0);
+        if(i===0) liveHands=r.hands;
+        r.hands=[];
+        sims.push(r);
+      }
+      const finals=sims.map(s=>s.final_bankroll).sort((a,b)=>a-b);
+      const n=finals.length,mean=finals.reduce((a,b)=>a+b,0)/n;
+      const variance=finals.reduce((a,b)=>a+(b-mean)**2,0)/n;
+      results[sKey]={meta:STRATEGIES[sKey],sims,live_hands:liveHands,
+        summary:{mean:Math.round(mean*100)/100,median:finals[Math.floor(n/2)],
+          std:Math.round(Math.sqrt(variance)*100)/100,min:finals[0],max:finals[n-1],
+          p10:finals[Math.floor(n*0.1)],p90:finals[Math.floor(n*0.9)],
+          ruin_rate:Math.round(sims.filter(s=>s.ruined).length/n*1e4)/1e4,
+          avg_max_drawdown:Math.round(sims.reduce((a,s)=>a+s.max_drawdown,0)/n*1e4)/1e4,
+          roi:Math.round((mean-state.sim.bankroll)/state.sim.bankroll*1e4)/100}};
+    }
+    state.results=results;
+    document.getElementById("empty-state").style.display="none";
+    renderCurrentTab();
+    btn.disabled=false; btn.textContent="RUN SIMULATION";
+  },30);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RENDERING
+// ══════════════════════════════════════════════════════════════════════════════
+
+function switchTab(tab){
+  state.currentTab=tab;
+  ["bankroll","distribution","stats","live"].forEach(t=>{
+    document.getElementById(`tab-${t}`).classList.toggle("active",t===tab);
+    document.getElementById(`view-${t}`).style.display=t===tab&&state.results?"block":"none";
+  });
+  if(tab!=="live") stopLive();
+  if(state.results) renderCurrentTab();
+}
+
+function renderCurrentTab(){
+  if(!state.results) return;
+  switch(state.currentTab){
+    case "bankroll": renderBankroll(); break;
+    case "distribution": renderDistribution(); break;
+    case "stats": renderStats(); break;
+    case "live": renderLive(); break;
+  }
+}
+
+// ── Bankroll Chart (D3) ──
+function renderBankroll(){
+  const container=document.getElementById("view-bankroll");
+  container.innerHTML="";
+  const wrap=document.createElement("div");
+  wrap.className="chart-container";
+  container.appendChild(wrap);
+
+  const headerEl=document.createElement("div");
+  headerEl.className="chart-header";
+  headerEl.innerHTML=`<span class="chart-label">BANKROLL OVER TIME</span><span class="chart-label">${state.sim.sims>1?"MEAN ± P10/P90 BANDS":"SINGLE RUN"}</span>`;
+  wrap.appendChild(headerEl);
+
+  const margin={top:20,right:30,bottom:40,left:65};
+  const width=wrap.clientWidth-margin.left-margin.right-40;
+  const height=380;
+
+  const svg=d3.select(wrap).append("svg")
+    .attr("width",width+margin.left+margin.right)
+    .attr("height",height+margin.top+margin.bottom)
+    .append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+
+  // Aggregate data
+  const keys=[...state.activeStrategies];
+  const firstKey=keys[0], firstSim=state.results[firstKey];
+  if(!firstSim) return;
+  const len=firstSim.sims[0].history.length;
+  const data=[];
+  for(let i=0;i<len;i++){
+    const pt={hand:firstSim.sims[0].history[i].hand};
+    for(const sKey of keys){
+      const runs=state.results[sKey].sims;
+      const vals=runs.map(r=>r.history[Math.min(i,r.history.length-1)]?.bankroll??0);
+      const mean=vals.reduce((a,b)=>a+b,0)/vals.length;
+      const sorted=[...vals].sort((a,b)=>a-b);
+      pt[`${sKey}_mean`]=Math.round(mean);
+      pt[`${sKey}_p10`]=sorted[Math.floor(vals.length*0.1)]??sorted[0];
+      pt[`${sKey}_p90`]=sorted[Math.floor(vals.length*0.9)]??sorted[sorted.length-1];
+    }
+    data.push(pt);
+  }
+
+  // Scales
+  let yMin=Infinity,yMax=-Infinity;
+  for(const d of data) for(const k of keys){
+    yMin=Math.min(yMin,d[`${k}_p10`]??d[`${k}_mean`]);
+    yMax=Math.max(yMax,d[`${k}_p90`]??d[`${k}_mean`]);
+  }
+  const x=d3.scaleLinear().domain([0,data[data.length-1].hand]).range([0,width]);
+  const y=d3.scaleLinear().domain([Math.max(0,yMin*0.9),yMax*1.05]).range([height,0]);
+
+  // Grid
+  svg.append("g").attr("class","grid").attr("transform",`translate(0,${height})`).call(d3.axisBottom(x).tickSize(-height).tickFormat(""));
+  svg.append("g").attr("class","grid").call(d3.axisLeft(y).tickSize(-width).tickFormat(""));
+
+  // Axes
+  svg.append("g").attr("class","axis").attr("transform",`translate(0,${height})`)
+    .call(d3.axisBottom(x).ticks(8).tickFormat(v=>v>=1000?`${(v/1000).toFixed(0)}k`:v));
+  svg.append("g").attr("class","axis")
+    .call(d3.axisLeft(y).ticks(6).tickFormat(v=>v>=10000?`$${(v/1000).toFixed(0)}k`:`$${v.toLocaleString()}`));
+
+  // Reference line at starting bankroll
+  svg.append("line").attr("x1",0).attr("x2",width)
+    .attr("y1",y(state.sim.bankroll)).attr("y2",y(state.sim.bankroll))
+    .attr("stroke","#d4a843").attr("stroke-dasharray","6,4").attr("stroke-width",1).attr("opacity",0.3);
+
+  // Bands + lines
+  for(const sKey of keys){
+    const col=STRATEGIES[sKey].color;
+    if(state.sim.sims>1){
+      const area=d3.area().x(d=>x(d.hand)).y0(d=>y(d[`${sKey}_p10`])).y1(d=>y(d[`${sKey}_p90`])).curve(d3.curveMonotoneX);
+      svg.append("path").datum(data).attr("d",area).attr("fill",col).attr("opacity",0.1);
+    }
+    const line=d3.line().x(d=>x(d.hand)).y(d=>y(d[`${sKey}_mean`])).curve(d3.curveMonotoneX);
+    const path=svg.append("path").datum(data).attr("d",line).attr("fill","none").attr("stroke",col).attr("stroke-width",2.5);
+    // Animate
+    const totalLen=path.node().getTotalLength();
+    path.attr("stroke-dasharray",totalLen).attr("stroke-dashoffset",totalLen)
+      .transition().duration(1200).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
+  }
+
+  // Tooltip overlay
+  const tooltip=document.getElementById("tooltip");
+  const bisect=d3.bisector(d=>d.hand).left;
+  svg.append("rect").attr("width",width).attr("height",height).attr("fill","transparent")
+    .on("mousemove",function(event){
+      const [mx]=d3.pointer(event);
+      const xVal=x.invert(mx);
+      const i=bisect(data,xVal,1);
+      const d=data[i]||data[data.length-1];
+      let html=`<div style="color:#888;margin-bottom:4px;">Hand ${d.hand.toLocaleString()}</div>`;
+      for(const sKey of keys){
+        html+=`<div style="color:${STRATEGIES[sKey].color}">${STRATEGIES[sKey].name}: $${d[`${sKey}_mean`].toLocaleString()}</div>`;
+      }
+      tooltip.innerHTML=html;
+      tooltip.style.opacity=1;
+      tooltip.style.left=event.pageX+12+"px";
+      tooltip.style.top=event.pageY-20+"px";
+    })
+    .on("mouseleave",()=>{tooltip.style.opacity=0;});
+
+  // Legend
+  const legend=document.createElement("div");
+  legend.className="legend";
+  for(const sKey of keys){
+    legend.innerHTML+=`<div class="legend-item"><div class="legend-swatch" style="background:${STRATEGIES[sKey].color}"></div>${STRATEGIES[sKey].name}</div>`;
+  }
+  wrap.appendChild(legend);
+}
+
+// ── Distribution Histogram ──
+function renderDistribution(){
+  const container=document.getElementById("view-distribution");
+  container.innerHTML="";
+  const wrap=document.createElement("div");
+  wrap.className="chart-container";
+  container.appendChild(wrap);
+
+  const keys=[...state.activeStrategies];
+  let selKey=keys[0];
+
+  const headerEl=document.createElement("div");
+  headerEl.className="chart-header";
+  const lblEl=document.createElement("span");
+  lblEl.className="chart-label";
+  lblEl.textContent="FINAL BANKROLL DISTRIBUTION";
+  headerEl.appendChild(lblEl);
+  const btnsEl=document.createElement("div");
+  btnsEl.className="dist-buttons";
+  headerEl.appendChild(btnsEl);
+  wrap.appendChild(headerEl);
+
+  const chartArea=document.createElement("div");
+  chartArea.id="dist-chart-area";
+  wrap.appendChild(chartArea);
+
+  function renderBars(sKey){
+    selKey=sKey;
+    btnsEl.innerHTML="";
+    for(const k of keys){
+      const b=document.createElement("button");
+      b.className="dist-btn"+(k===sKey?" active":"");
+      b.style.borderColor=k===sKey?STRATEGIES[k].color:"";
+      b.style.color=k===sKey?STRATEGIES[k].color:"";
+      b.textContent=STRATEGIES[k].name;
+      b.onclick=()=>renderBars(k);
+      btnsEl.appendChild(b);
+    }
+    chartArea.innerHTML="";
+
+    const runs=state.results[sKey].sims;
+    const finals=runs.map(r=>r.final_bankroll);
+    const min=Math.min(...finals),max=Math.max(...finals);
+    const range=max-min||1;
+    const numBins=Math.min(30,Math.max(10,Math.floor(runs.length/2)));
+    const binW=range/numBins;
+    const bins=Array.from({length:numBins},(_,i)=>({
+      x0:min+i*binW,x1:min+(i+1)*binW,count:0,profit:(min+i*binW+binW/2)>=state.sim.bankroll
+    }));
+    for(const f of finals){const idx=Math.min(Math.floor((f-min)/binW),numBins-1);bins[idx].count++;}
+
+    const margin={top:20,right:30,bottom:40,left:50};
+    const width=chartArea.clientWidth||wrap.clientWidth-40;
+    const w=width-margin.left-margin.right;
+    const h=300;
+
+    const svg=d3.select(chartArea).append("svg").attr("width",w+margin.left+margin.right).attr("height",h+margin.top+margin.bottom)
+      .append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+
+    const x=d3.scaleBand().domain(bins.map((_,i)=>i)).range([0,w]).padding(0.15);
+    const yMax=d3.max(bins,d=>d.count);
+    const y=d3.scaleLinear().domain([0,yMax]).range([h,0]);
+
+    svg.append("g").attr("class","grid").call(d3.axisLeft(y).tickSize(-w).tickFormat(""));
+    svg.append("g").attr("class","axis").attr("transform",`translate(0,${h})`)
+      .call(d3.axisBottom(x).tickValues(bins.map((_,i)=>i).filter((_,i)=>i%(Math.ceil(numBins/8))===0))
+        .tickFormat(i=>`$${Math.round(bins[i].x0).toLocaleString()}`));
+    svg.append("g").attr("class","axis").call(d3.axisLeft(y).ticks(5));
+
+    const col=STRATEGIES[sKey].color;
+    svg.selectAll(".bar").data(bins).enter().append("rect")
+      .attr("x",(_,i)=>x(i)).attr("width",x.bandwidth())
+      .attr("y",h).attr("height",0)
+      .attr("rx",3)
+      .attr("fill",d=>d.profit?col:"#ef535088")
+      .transition().duration(600).ease(d3.easeCubicOut)
+      .attr("y",d=>y(d.count)).attr("height",d=>h-y(d.count));
+
+    // Legend
+    const leg=document.createElement("div");
+    leg.style.cssText="text-align:center;margin-top:10px;font:11px var(--font-mono);color:#555";
+    leg.innerHTML=`<span style="color:#ef5350">■</span> Loss &nbsp;&nbsp; <span style="color:${col}">■</span> Profit`;
+    chartArea.appendChild(leg);
+  }
+
+  renderBars(selKey);
+}
+
+// ── Stats Table ──
+function renderStats(){
+  const container=document.getElementById("view-stats");
+  container.innerHTML="";
+  const wrap=document.createElement("div");
+  wrap.className="chart-container";
+  container.appendChild(wrap);
+
+  const lbl=document.createElement("span");
+  lbl.className="chart-label";
+  lbl.textContent="STRATEGY COMPARISON";
+  wrap.appendChild(lbl);
+
+  const fmtK=v=>Math.abs(v)>=10000?`$${(v/1000).toFixed(0)}k`:`$${Math.round(v).toLocaleString()}`;
+
+  let html=`<table class="stats-table"><thead><tr>
+    <th>Strategy</th><th>Mean</th><th>Median</th><th>Std Dev</th><th>Min</th><th>Max</th><th>Ruin %</th><th>Max DD</th>
+  </tr></thead><tbody>`;
+  for(const sKey of state.activeStrategies){
+    const d=state.results[sKey]; if(!d) continue;
+    const s=d.summary, m=d.meta;
+    const roiColor=s.roi>=0?"var(--green)":"var(--red)";
+    html+=`<tr>
+      <td><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${m.color};margin-right:8px;vertical-align:middle"></span>${m.name}</td>
+      <td style="color:${roiColor}">${fmtK(s.mean)} <span style="font-size:10px;color:#666">(${s.roi>0?"+":""}${s.roi}%)</span></td>
+      <td>${fmtK(s.median)}</td><td>${fmtK(s.std)}</td>
+      <td style="color:#ef535088">${fmtK(s.min)}</td><td style="color:#66bb6a88">${fmtK(s.max)}</td>
+      <td style="color:${s.ruin_rate>0?"var(--red)":"var(--green)"}">${(s.ruin_rate*100).toFixed(1)}%</td>
+      <td style="color:#ffa726">${(s.avg_max_drawdown*100).toFixed(1)}%</td>
+    </tr>`;
+  }
+  html+=`</tbody></table>`;
+  wrap.innerHTML+=html;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LIVE REPLAY MODE
+// ══════════════════════════════════════════════════════════════════════════════
+
+function renderLive(){
+  const container=document.getElementById("view-live");
+  container.innerHTML="";
+
+  const keys=[...state.activeStrategies];
+  if(!state.liveState.strategy||!keys.includes(state.liveState.strategy)) state.liveState.strategy=keys[0];
+  const sKey=state.liveState.strategy;
+  const hands=state.results[sKey]?.live_hands;
+  if(!hands||hands.length===0){
+    container.innerHTML=`<div class="empty-state"><p>No hand data available for live replay.</p></div>`;
+    return;
+  }
+
+  // Controls panel
+  const panel=document.createElement("div");
+  panel.className="live-panel";
+  panel.innerHTML=`
+    <div class="live-controls">
+      <button class="btn" id="live-play">▶ PLAY</button>
+      <button class="btn" id="live-pause" style="display:none">❚❚ PAUSE</button>
+      <button class="btn" id="live-step">STEP →</button>
+      <button class="btn" id="live-reset">⟲ RESET</button>
+      <span style="font:11px var(--font-mono);color:#888;margin-left:8px;">SPEED</span>
+      <input type="range" class="speed-slider" id="live-speed" min="1" max="200" value="${state.liveState.speed}">
+      <span style="font:11px var(--font-mono);color:var(--gold)" id="speed-label">${state.liveState.speed} h/s</span>
+      <div style="flex:1"></div>
+      <div class="strategy-selector" id="live-strat-btns"></div>
+    </div>
+    <div class="cards-display" id="live-cards">
+      <div class="card-group"><h4>PLAYER</h4><div class="card-row" id="player-cards"></div><div style="font:700 14px var(--font-mono);color:#888;margin-top:4px" id="player-total"></div></div>
+      <div class="card-group"><h4>DEALER</h4><div class="card-row" id="dealer-cards"></div><div style="font:700 14px var(--font-mono);color:#888;margin-top:4px" id="dealer-total"></div></div>
+      <div style="flex:1;text-align:right;display:flex;flex-direction:column;justify-content:center;" id="hand-result-display"></div>
+    </div>
+    <div class="live-stats" id="live-stats-grid"></div>
+  `;
+  container.appendChild(panel);
+
+  // Strategy selector
+  const stratBtns=panel.querySelector("#live-strat-btns");
+  for(const k of keys){
+    const b=document.createElement("button");
+    b.className="btn"+(k===sKey?" active":"");
+    b.textContent=STRATEGIES[k].name;
+    b.style.fontSize="11px"; b.style.padding="4px 10px";
+    b.onclick=()=>{
+      state.liveState.strategy=k;
+      state.liveState.handIdx=0;
+      stopLive();
+      renderLive();
+    };
+    stratBtns.appendChild(b);
+  }
+
+  // Chart area
+  const chartWrap=document.createElement("div");
+  chartWrap.className="chart-container";
+  chartWrap.style.marginTop="16px";
+  chartWrap.innerHTML=`<div class="chart-header"><span class="chart-label">LIVE BANKROLL</span><span class="chart-label" id="live-hand-counter">Hand 0 / ${hands.length}</span></div>`;
+  container.appendChild(chartWrap);
+
+  const margin={top:20,right:30,bottom:40,left:65};
+  const svgWidth=chartWrap.clientWidth-40;
+  const w=svgWidth-margin.left-margin.right;
+  const h=300;
+  const col=STRATEGIES[sKey].color;
+
+  // Pre-compute y domain from all hands
+  const allBR=hands.map(h=>h.bankroll);
+  const yMin=Math.max(0,Math.min(...allBR)*0.9);
+  const yMax=Math.max(...allBR)*1.05;
+
+  const svg=d3.select(chartWrap).append("svg").attr("width",w+margin.left+margin.right).attr("height",h+margin.top+margin.bottom)
+    .append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+
+  const xScale=d3.scaleLinear().domain([0,hands.length]).range([0,w]);
+  const yScale=d3.scaleLinear().domain([yMin,yMax]).range([h,0]);
+
+  svg.append("g").attr("class","grid").attr("transform",`translate(0,${h})`).call(d3.axisBottom(xScale).tickSize(-h).tickFormat(""));
+  svg.append("g").attr("class","grid").call(d3.axisLeft(yScale).tickSize(-w).tickFormat(""));
+  svg.append("g").attr("class","axis").attr("transform",`translate(0,${h})`).call(d3.axisBottom(xScale).ticks(8).tickFormat(v=>v>=1000?`${(v/1000).toFixed(0)}k`:v));
+  svg.append("g").attr("class","axis").call(d3.axisLeft(yScale).ticks(6).tickFormat(v=>`$${v>=10000?(v/1000).toFixed(0)+"k":v.toLocaleString()}`));
+
+  // Reference line
+  svg.append("line").attr("x1",0).attr("x2",w).attr("y1",yScale(state.sim.bankroll)).attr("y2",yScale(state.sim.bankroll))
+    .attr("stroke","#d4a843").attr("stroke-dasharray","6,4").attr("stroke-width",1).attr("opacity",0.3);
+
+  // Live path
+  const lineFn=d3.line().x(d=>xScale(d.hand_num)).y(d=>yScale(d.bankroll)).curve(d3.curveMonotoneX);
+  const livePath=svg.append("path").attr("fill","none").attr("stroke",col).attr("stroke-width",2.5);
+  // Dot
+  const dot=svg.append("circle").attr("r",4).attr("fill",col).attr("opacity",0);
+  // Win/loss flash
+  const flash=svg.append("circle").attr("r",8).attr("fill",col).attr("opacity",0);
+
+  function renderCard(rank){
+    const isRed=["♥","♦"].some(s=>rank.includes&&rank.includes(s))||false;
+    return `<div class="playing-card${isRed?" red":""}">${rank}</div>`;
+  }
+
+  function updateDisplay(idx){
+    if(idx<0||idx>=hands.length) return;
+    const hand=hands[idx];
+    const slice=[{hand_num:0,bankroll:state.sim.bankroll},...hands.slice(0,idx+1)];
+    livePath.attr("d",lineFn(slice));
+    dot.attr("cx",xScale(hand.hand_num)).attr("cy",yScale(hand.bankroll)).attr("opacity",1);
+
+    // Flash effect
+    flash.attr("cx",xScale(hand.hand_num)).attr("cy",yScale(hand.bankroll))
+      .attr("fill",hand.net>=0?col:"#ef5350").attr("opacity",0.6)
+      .transition().duration(300).attr("opacity",0).attr("r",16)
+      .transition().attr("r",8);
+
+    // Cards
+    document.getElementById("player-cards").innerHTML=hand.player_cards.map(renderCard).join("");
+    document.getElementById("dealer-cards").innerHTML=hand.dealer_cards.map(renderCard).join("");
+    document.getElementById("player-total").textContent=hand.player_total||"Split";
+    document.getElementById("dealer-total").textContent=hand.dealer_total;
+
+    // Result
+    const resEl=document.getElementById("hand-result-display");
+    const resColors={win:col,blackjack:"#ffd54f",loss:"#ef5350",push:"#888"};
+    const resLabels={win:"WIN",blackjack:"BLACKJACK!",loss:"LOSS",push:"PUSH"};
+    resEl.innerHTML=`
+      <div style="font:700 20px var(--font-mono);color:${resColors[hand.result]}">${resLabels[hand.result]}</div>
+      <div style="font:13px var(--font-mono);color:${hand.net>=0?col:"#ef5350"};margin-top:4px">${hand.net>=0?"+":""}$${hand.net.toLocaleString()}</div>
+      <div style="font:11px var(--font-mono);color:#666;margin-top:2px">Bet: $${hand.bet.toLocaleString()}</div>
+    `;
+
+    // Stats
+    const played=hands.slice(0,idx+1);
+    const w=played.filter(h=>h.result==="win"||h.result==="blackjack").length;
+    const l=played.filter(h=>h.result==="loss").length;
+    const totalNet=played.reduce((a,h)=>a+h.net,0);
+    let statsHTML=`
+      <div class="live-stat"><div class="val">$${hand.bankroll.toLocaleString()}</div><div class="lbl">BANKROLL</div></div>
+      <div class="live-stat"><div class="val">${hand.hand_num}</div><div class="lbl">HAND #</div></div>
+      <div class="live-stat"><div class="val" style="color:${totalNet>=0?col:"#ef5350"}">${totalNet>=0?"+":""}$${Math.round(totalNet).toLocaleString()}</div><div class="lbl">NET P&L</div></div>
+      <div class="live-stat"><div class="val">${w}</div><div class="lbl">WINS</div></div>
+      <div class="live-stat"><div class="val" style="color:#ef5350">${l}</div><div class="lbl">LOSSES</div></div>
+      <div class="live-stat"><div class="val">${(w/(w+l||1)*100).toFixed(1)}%</div><div class="lbl">WIN RATE</div></div>
+    `;
+    if(hand.running_count!==undefined){
+      statsHTML+=`
+        <div class="live-stat"><div class="val">${hand.running_count}</div><div class="lbl">RUNNING COUNT</div></div>
+        <div class="live-stat"><div class="val">${hand.true_count}</div><div class="lbl">TRUE COUNT</div></div>
+      `;
+    }
+    document.getElementById("live-stats-grid").innerHTML=statsHTML;
+    document.getElementById("live-hand-counter").textContent=`Hand ${hand.hand_num} / ${hands.length}`;
+  }
+
+  // Controls
+  const playBtn=document.getElementById("live-play");
+  const pauseBtn=document.getElementById("live-pause");
+  const stepBtn=document.getElementById("live-step");
+  const resetBtn=document.getElementById("live-reset");
+  const speedSlider=document.getElementById("live-speed");
+  const speedLabel=document.getElementById("speed-label");
+
+  speedSlider.oninput=()=>{
+    state.liveState.speed=+speedSlider.value;
+    speedLabel.textContent=`${state.liveState.speed} h/s`;
+    if(state.liveState.playing){stopLive();startLive();}
+  };
+
+  function startLive(){
+    state.liveState.playing=true;
+    playBtn.style.display="none";
+    pauseBtn.style.display="inline-block";
+    const interval=Math.max(5,Math.round(1000/state.liveState.speed));
+    state.liveState.timer=setInterval(()=>{
+      if(state.liveState.handIdx>=hands.length-1){stopLive();return;}
+      state.liveState.handIdx++;
+      updateDisplay(state.liveState.handIdx);
+    },interval);
+  }
+
+  playBtn.onclick=()=>startLive();
+  pauseBtn.onclick=()=>stopLive();
+  stepBtn.onclick=()=>{
+    if(state.liveState.handIdx<hands.length-1){
+      state.liveState.handIdx++;
+      updateDisplay(state.liveState.handIdx);
+    }
+  };
+  resetBtn.onclick=()=>{
+    stopLive();
+    state.liveState.handIdx=0;
+    livePath.attr("d","");
+    dot.attr("opacity",0);
+    document.getElementById("player-cards").innerHTML="";
+    document.getElementById("dealer-cards").innerHTML="";
+    document.getElementById("player-total").textContent="";
+    document.getElementById("dealer-total").textContent="";
+    document.getElementById("hand-result-display").innerHTML="";
+    document.getElementById("live-stats-grid").innerHTML="";
+    document.getElementById("live-hand-counter").textContent=`Hand 0 / ${hands.length}`;
+  };
+
+  // Show first hand if we have one
+  if(state.liveState.handIdx>0) updateDisplay(state.liveState.handIdx);
+}
+
+function stopLive(){
+  state.liveState.playing=false;
+  if(state.liveState.timer){clearInterval(state.liveState.timer);state.liveState.timer=null;}
+  const playBtn=document.getElementById("live-play");
+  const pauseBtn=document.getElementById("live-pause");
+  if(playBtn) playBtn.style.display="inline-block";
+  if(pauseBtn) pauseBtn.style.display="none";
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIDEBAR SETUP
+// ══════════════════════════════════════════════════════════════════════════════
+
+function buildSidebar(){
+  const sc=document.getElementById("settings-container");
+  const settings=[
+    {key:"decks",label:"Decks",min:1,max:8,step:1,fmt:v=>v},
+    {key:"penetration",label:"Penetration",min:50,max:95,step:5,fmt:v=>v+"%"},
+    {key:"tableMin",label:"Table Min",min:5,max:100,step:5,fmt:v=>"$"+v},
+    {key:"tableMax",label:"Table Max",min:500,max:25000,step:500,fmt:v=>v>=1000?"$"+(v/1000)+"k":"$"+v},
+  ];
+  for(const s of settings){
+    const row=document.createElement("div");
+    row.className="setting-row";
+    row.innerHTML=`<div class="row-top"><span class="lbl">${s.label}</span><span class="val" id="val-${s.key}">${s.fmt(state.settings[s.key])}</span></div>
+      <input type="range" min="${s.min}" max="${s.max}" step="${s.step}" value="${state.settings[s.key]}" id="slider-${s.key}">`;
+    sc.appendChild(row);
+    row.querySelector("input").oninput=e=>{
+      state.settings[s.key]=+e.target.value;
+      document.getElementById(`val-${s.key}`).textContent=s.fmt(state.settings[s.key]);
+    };
+  }
+  // Toggles
+  const toggles=[
+    {key:"bjPays",label:"BJ Pays",options:["3:2","6:5"]},
+    {key:"dealerS17",label:"Dealer S17",options:["Yes","No"],map:v=>v==="Yes"},
+  ];
+  for(const t of toggles){
+    const row=document.createElement("div");
+    row.className="toggle-row";
+    const curVal=t.map?(!state.settings[t.key]?"No":"Yes"):state.settings[t.key];
+    row.innerHTML=`<span class="lbl">${t.label}</span><div class="toggle-group">${
+      t.options.map(o=>`<button class="toggle-opt${o===curVal?" active":""}" data-key="${t.key}" data-val="${o}">${o}</button>`).join("")
+    }</div>`;
+    sc.appendChild(row);
+    row.querySelectorAll(".toggle-opt").forEach(btn=>{
+      btn.onclick=()=>{
+        const val=btn.dataset.val;
+        state.settings[t.key]=t.map?t.map(val):val;
+        row.querySelectorAll(".toggle-opt").forEach(b=>b.classList.toggle("active",b.dataset.val===val));
+      };
+    });
+  }
+
+  // Sim settings
+  const ssc=document.getElementById("sim-settings-container");
+  const simSettings=[
+    {key:"bankroll",label:"Bankroll",min:500,max:100000,step:500,fmt:v=>v>=10000?"$"+(v/1000)+"k":"$"+v},
+    {key:"hands",label:"Hands",min:100,max:50000,step:100,fmt:v=>v>=1000?(v/1000)+"k":v},
+    {key:"sims",label:"Simulations",min:1,max:200,step:1,fmt:v=>v},
+  ];
+  for(const s of simSettings){
+    const row=document.createElement("div");
+    row.className="setting-row";
+    row.innerHTML=`<div class="row-top"><span class="lbl">${s.label}</span><span class="val" id="val-${s.key}">${s.fmt(state.sim[s.key])}</span></div>
+      <input type="range" min="${s.min}" max="${s.max}" step="${s.step}" value="${state.sim[s.key]}" id="slider-${s.key}">`;
+    ssc.appendChild(row);
+    row.querySelector("input").oninput=e=>{
+      state.sim[s.key]=+e.target.value;
+      document.getElementById(`val-${s.key}`).textContent=s.fmt(state.sim[s.key]);
+    };
+  }
+
+  // Strategies
+  const stc=document.getElementById("strategies-container");
+  for(const [key,meta] of Object.entries(STRATEGIES)){
+    const btn=document.createElement("button");
+    btn.className="strategy-btn"+(state.activeStrategies.has(key)?" active":"");
+    btn.id=`strat-${key}`;
+    btn.innerHTML=`<span class="dot" style="background:${state.activeStrategies.has(key)?meta.color:"#2a2d3a"}"></span><span class="label">${meta.name}</span><div class="desc">${meta.desc}</div>`;
+    btn.onclick=()=>{
+      if(state.activeStrategies.has(key)) state.activeStrategies.delete(key);
+      else state.activeStrategies.add(key);
+      btn.classList.toggle("active",state.activeStrategies.has(key));
+      btn.querySelector(".dot").style.background=state.activeStrategies.has(key)?meta.color:"#2a2d3a";
+    };
+    stc.appendChild(btn);
+  }
+}
+
+buildSidebar();
+</script>
+</body>
+</html>
