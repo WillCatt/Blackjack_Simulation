@@ -11,7 +11,7 @@ Strategies implemented:
     - 1-3-2-6 system (positive progression)
     - Oscar's Grind (conservative grind)
     - Hi-Lo card counting (true-count proportional sizing)
-    - Hi-Lo CHEATING: same hand-play as everyone else, but the cheater always
+        - Hi-Lo CHEATING: same hand-play as everyone else, but the cheater always
       knows the EXACT true count of the remaining shoe (perfect recall + no
       counting errors + no deck-estimation slop), so they bet with full
       confidence on the optimal ramp.
@@ -1113,6 +1113,22 @@ def run_simulation(config: SimConfig) -> Dict:
         total_hands_played = sum(max(s.get("hands_played", config.num_hands), 1) for s in sims)
         ev_per_hand = total_profit / max(total_hands_played, 1)
 
+        # ── Survival-duration metrics ──
+        # How many hands does the strategy typically last? Critical for the
+        # progressive systems where the answer is "less than you think".
+        hands_lasted = sorted(s.get("hands_played", config.num_hands) for s in sims)
+        ruined_durations = sorted(
+            s.get("hands_played", config.num_hands) for s in sims if s.get("ruined")
+        )
+        avg_hands_lasted = sum(hands_lasted) / max(len(hands_lasted), 1)
+        median_hands_lasted = hands_lasted[len(hands_lasted) // 2] if hands_lasted else 0
+        avg_ruin_hand = (
+            sum(ruined_durations) / len(ruined_durations) if ruined_durations else None
+        )
+        median_ruin_hand = (
+            ruined_durations[len(ruined_durations) // 2] if ruined_durations else None
+        )
+
         def _pct(p: float) -> float:
             idx = max(0, min(n - 1, int(round(p * (n - 1)))))
             return finals_sorted[idx]
@@ -1233,11 +1249,31 @@ def run_simulation(config: SimConfig) -> Dict:
             "profit_chance_pct": round(profit_chance * 100, 2),
             "ev_per_hand": round(ev_per_hand, 4),
             "median_profit": round(median_final - config.start_bankroll, 2),
+            "avg_hands_lasted": round(avg_hands_lasted, 1),
+            "median_hands_lasted": int(median_hands_lasted),
+            "avg_ruin_hand": round(avg_ruin_hand, 1) if avg_ruin_hand is not None else None,
+            "median_ruin_hand": int(median_ruin_hand) if median_ruin_hand is not None else None,
             "color_status": color_status,
             "tags": tags,
             "warning": warning,
             "curves": curves,
             "finals": [round(f, 2) for f in finals],   # for distribution chart
+            # Per-sim outcome ledger drives the new distribution timeline.
+            "outcomes": [
+                {
+                    "final": round(s["final_bankroll"], 2),
+                    "hands": s.get("hands_played", config.num_hands),
+                    "outcome": (
+                        "ruined"  if s.get("ruined")
+                        else "stopped_loss"   if s.get("stopped_loss")
+                        else "stopped_profit" if s.get("stopped_profit")
+                        else ("profit" if s["final_bankroll"] > config.start_bankroll
+                              else ("loss" if s["final_bankroll"] < config.start_bankroll
+                                    else "break_even"))
+                    ),
+                }
+                for s in sims
+            ],
         }
 
         # MIT team — also surface average per-role final bankrolls.

@@ -378,6 +378,7 @@
     <button class="btn" id="tab-survival" onclick="switchTab('survival')">SURVIVAL</button>
     <button class="btn" id="tab-stats" onclick="switchTab('stats')">STATS</button>
     <button class="btn" id="tab-team" onclick="switchTab('team')">MIT TEAM</button>
+    <button class="btn" id="tab-sweep" onclick="switchTab('sweep')">SWEEP</button>
     <button class="btn" id="tab-live" onclick="switchTab('live')">LIVE</button>
     <button class="btn btn-gold" id="run-btn" onclick="runSimulation()">RUN SIMULATION</button>
   </div>
@@ -412,6 +413,7 @@
     <div id="view-survival" style="display:none;"></div>
     <div id="view-stats" style="display:none;"></div>
     <div id="view-team" style="display:none;"></div>
+    <div id="view-sweep" style="display:none;"></div>
     <div id="view-live" style="display:none;"></div>
   </div>
 </div>
@@ -453,6 +455,17 @@ let state = {
   results: null,
   currentTab: "bankroll",
   liveState: { playing: false, timer: null, speed: 50, handIdx: 0, strategy: "flat" },
+  // Hyperparameter sweep — runs fresh sims, doesn't reuse the main results.
+  sweep: {
+    param: "decks",
+    simsPerPoint: 50,
+    handsPerPoint: 1500,
+    noMaxBet: false,
+    infiniteBankroll: false,
+    running: false,
+    progress: 0,
+    results: null, // {param, points: [{x, label, perStrategy: {sKey: {profit_chance, ruin, median, ev}}}]}
+  },
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -873,6 +886,14 @@ function runSimulation(){
       const totalHandsPlayed=sims.reduce((a,s)=>a+Math.max(s.hands_played||numH,1),0);
       const evPerHand=totalProfit/Math.max(totalHandsPlayed,1);
 
+      // Survival-duration metrics — when do strategies typically fold?
+      const handsLasted=sims.map(s=>s.hands_played||numH).sort((a,b)=>a-b);
+      const ruinedHands=sims.filter(s=>s.ruined).map(s=>s.hands_played||numH).sort((a,b)=>a-b);
+      const avgHandsLasted=handsLasted.reduce((a,b)=>a+b,0)/Math.max(handsLasted.length,1);
+      const medianHandsLasted=handsLasted[Math.floor(handsLasted.length/2)]||0;
+      const avgRuinHand=ruinedHands.length?ruinedHands.reduce((a,b)=>a+b,0)/ruinedHands.length:null;
+      const medianRuinHand=ruinedHands.length?ruinedHands[Math.floor(ruinedHands.length/2)]:null;
+
       // ── Survival & profit-probability curves + percentile bands ──
       const NPOINTS=60;
       const grid=[]; for(let i=0;i<=NPOINTS;i++) grid.push(Math.round(numH*i/NPOINTS));
@@ -950,11 +971,25 @@ function runSimulation(){
         profit_chance_pct:Math.round(profitChance*1e4)/100,
         ev_per_hand:Math.round(evPerHand*1e4)/1e4,
         median_profit:Math.round((median-startB)*100)/100,
+        avg_hands_lasted:Math.round(avgHandsLasted*10)/10,
+        median_hands_lasted:Math.round(medianHandsLasted),
+        avg_ruin_hand:avgRuinHand!=null?Math.round(avgRuinHand*10)/10:null,
+        median_ruin_hand:medianRuinHand!=null?Math.round(medianRuinHand):null,
         color_status:colorStatus,
         tags,
         warning,
         curves,
         finals:finals.map(f=>Math.round(f*100)/100),
+        // Per-sim outcome ledger drives the new distribution timeline.
+        outcomes: sims.map(s=>({
+          final: Math.round(s.final_bankroll*100)/100,
+          hands: s.hands_played||numH,
+          outcome: s.ruined ? "ruined"
+                 : s.stopped_loss ? "stopped_loss"
+                 : s.stopped_profit ? "stopped_profit"
+                 : (s.final_bankroll>startB ? "profit"
+                    : (s.final_bankroll<startB ? "loss" : "break_even")),
+        })),
       };
 
       // MIT team — collate per-role aggregate finals.
@@ -985,15 +1020,20 @@ function runSimulation(){
 
 function switchTab(tab){
   state.currentTab=tab;
-  ["bankroll","distribution","survival","stats","team","live"].forEach(t=>{
+  // The Sweep tab can render even before the main simulation has run, since it
+  // does its own sweep runs from scratch.
+  ["bankroll","distribution","survival","stats","team","sweep","live"].forEach(t=>{
     document.getElementById(`tab-${t}`).classList.toggle("active",t===tab);
-    document.getElementById(`view-${t}`).style.display=t===tab&&state.results?"block":"none";
+    const showAlways=(t==="sweep");
+    document.getElementById(`view-${t}`).style.display=t===tab && (state.results||showAlways)?"block":"none";
   });
   if(tab!=="live") stopLive();
-  if(state.results) renderCurrentTab();
+  if(tab==="sweep") { renderSweep(); document.getElementById("empty-state").style.display="none"; }
+  else if(state.results) renderCurrentTab();
 }
 
 function renderCurrentTab(){
+  if(state.currentTab==="sweep"){ renderSweep(); return; }
   if(!state.results) return;
   switch(state.currentTab){
     case "bankroll": renderBankroll(); break;
@@ -1102,92 +1142,296 @@ function renderBankroll(){
   wrap.appendChild(legend);
 }
 
-// ── Distribution Histogram ──
+// ── Distribution View — outcome-centric, not "final $" centric ──
+// Three stacked panels:
+//   1) Outcome breakdown (stacked bar + bankrupt:profit ratio per strategy)
+//   2) Cumulative bankruptcy curve (% busted ≤ hand H, multi-strategy overlay)
+//   3) Termination timeline (each sim = one row, sorted by exit, color-coded by outcome)
+// The user explicitly asked for "percent bankrupt based on hand" and "the hand at
+// which it pulled out", so the timeline + cum-ruin curve answer that directly,
+// while the breakdown gives the at-a-glance bankrupt:profit ratio.
+const OUTCOME_META={
+  ruined:        {label:"Ruined / Bankrupt", color:"#ef5350"},
+  stopped_loss:  {label:"Stop-Loss Hit",     color:"#ff7043"},
+  loss:          {label:"Down (Survived)",   color:"#bcaaa4"},
+  break_even:    {label:"Break-Even",        color:"#90a4ae"},
+  profit:        {label:"Profit",            color:"#66bb6a"},
+  stopped_profit:{label:"Take-Profit Hit",   color:"#26a69a"},
+};
+const OUTCOME_ORDER=["ruined","stopped_loss","loss","break_even","profit","stopped_profit"];
+
 function renderDistribution(){
   const container=document.getElementById("view-distribution");
   container.innerHTML="";
-  const wrap=document.createElement("div");
-  wrap.className="chart-container";
-  container.appendChild(wrap);
-
   const keys=[...state.activeStrategies];
+  if(!keys.length || !state.results[keys[0]]) return;
+  const numH=state.sim.hands;
+
+  // ── Panel 1: Outcome Breakdown ──────────────────────────────────────────
+  const breakdownWrap=document.createElement("div");
+  breakdownWrap.className="chart-container";
+  breakdownWrap.style.marginBottom="14px";
+  breakdownWrap.innerHTML=`<div class="chart-header"><span class="chart-label">OUTCOME BREAKDOWN</span><span class="chart-label">SHARE OF SIMS BY EXIT CONDITION</span></div>`;
+  container.appendChild(breakdownWrap);
+
+  const breakdownInner=document.createElement("div");
+  breakdownInner.style.cssText="display:flex;flex-direction:column;gap:9px;padding:6px 0 4px 0;";
+  breakdownWrap.appendChild(breakdownInner);
+
+  for(const sKey of keys){
+    const outcomes=state.results[sKey].summary.outcomes||[];
+    const n=outcomes.length||1;
+    const counts=Object.fromEntries(OUTCOME_ORDER.map(o=>[o,0]));
+    for(const o of outcomes) if(counts[o.outcome]!==undefined) counts[o.outcome]++;
+    const profitCount=counts.profit+counts.stopped_profit;
+    const bankruptCount=counts.ruined+counts.stopped_loss;
+    const bpRatio=profitCount>0 ? (bankruptCount/profitCount).toFixed(2) : (bankruptCount>0?"∞":"—");
+
+    const row=document.createElement("div");
+    row.style.cssText="display:flex;align-items:center;gap:14px;font:11px var(--font-mono);";
+
+    const lbl=document.createElement("div");
+    lbl.style.cssText=`width:170px;color:${STRATEGIES[sKey].color};font-weight:700;`;
+    lbl.textContent=STRATEGIES[sKey].name;
+    row.appendChild(lbl);
+
+    const barWrap=document.createElement("div");
+    barWrap.style.cssText="flex:1;display:flex;height:22px;border-radius:3px;overflow:hidden;border:1px solid var(--border);";
+    for(const o of OUTCOME_ORDER){
+      const c=counts[o]; if(!c) continue;
+      const seg=document.createElement("div");
+      const pct=c/n*100;
+      seg.style.cssText=`background:${OUTCOME_META[o].color};width:${pct}%;display:flex;align-items:center;justify-content:center;color:#0a0c12;font:9px var(--font-mono);font-weight:700;`;
+      seg.textContent=pct>=8?`${pct.toFixed(0)}%`:"";
+      seg.title=`${OUTCOME_META[o].label}: ${c} (${pct.toFixed(1)}%)`;
+      barWrap.appendChild(seg);
+    }
+    row.appendChild(barWrap);
+
+    const ratioColor=bankruptCount>profitCount?"#ef5350":(bankruptCount<profitCount?"#66bb6a":"#888");
+    const ratioBox=document.createElement("div");
+    ratioBox.style.cssText="width:170px;text-align:right;";
+    ratioBox.innerHTML=`<div style="font:9px var(--font-mono);color:#666;letter-spacing:1px">BANKRUPT : PROFIT</div><div style="font:700 13px var(--font-mono);color:${ratioColor}">${bankruptCount} : ${profitCount} <span style="opacity:0.65;font-size:10px;color:#888">(×${bpRatio})</span></div>`;
+    row.appendChild(ratioBox);
+
+    breakdownInner.appendChild(row);
+  }
+
+  const obLeg=document.createElement("div");
+  obLeg.className="legend";
+  for(const o of OUTCOME_ORDER){
+    obLeg.innerHTML+=`<div class="legend-item"><div class="legend-swatch" style="background:${OUTCOME_META[o].color};height:10px;width:14px;border-radius:2px"></div>${OUTCOME_META[o].label}</div>`;
+  }
+  breakdownWrap.appendChild(obLeg);
+
+  // ── Panel 2: Cumulative Bankruptcy Curve ───────────────────────────────
+  const ruinWrap=document.createElement("div");
+  ruinWrap.className="chart-container";
+  ruinWrap.style.marginBottom="14px";
+  ruinWrap.innerHTML=`<div class="chart-header"><span class="chart-label">CUMULATIVE BANKRUPTCY BY HAND</span><span class="chart-label">% OF SIMS BUSTED ≤ HAND H</span></div>`;
+  container.appendChild(ruinWrap);
+
+  {
+    const margin={top:20,right:30,bottom:40,left:55};
+    const width=ruinWrap.clientWidth-margin.left-margin.right-40;
+    const height=240;
+    const svg=d3.select(ruinWrap).append("svg")
+      .attr("width",width+margin.left+margin.right)
+      .attr("height",height+margin.top+margin.bottom)
+      .append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+
+    const xS=d3.scaleLinear().domain([0,numH]).range([0,width]);
+    let yMax=0;
+    const series={};
+    const STEPS=80;
+    for(const sKey of keys){
+      const outs=state.results[sKey].summary.outcomes||[];
+      const total=outs.length||1;
+      // Stop-loss exits aren't bankruptcy in the strict sense, but they're a hard
+      // exit and the user is asking "when does this strategy pull out?" — so we
+      // include both ruin and stop-loss as the "out" event here.
+      const exitHands=outs.filter(o=>o.outcome==="ruined"||o.outcome==="stopped_loss").map(o=>o.hands).sort((a,b)=>a-b);
+      const ruinHands=outs.filter(o=>o.outcome==="ruined").map(o=>o.hands).sort((a,b)=>a-b);
+      const pts=[];
+      for(let i=0;i<=STEPS;i++){
+        const h=Math.round(numH*i/STEPS);
+        const exitCnt=exitHands.filter(rh=>rh<=h).length;
+        const ruinCnt=ruinHands.filter(rh=>rh<=h).length;
+        pts.push({hand:h, exit_pct:exitCnt/total*100, ruin_pct:ruinCnt/total*100});
+      }
+      yMax=Math.max(yMax,d3.max(pts,d=>d.exit_pct)||0);
+      series[sKey]=pts;
+    }
+    yMax=Math.max(5, Math.ceil(yMax/5)*5);
+    const yS=d3.scaleLinear().domain([0,yMax]).range([height,0]);
+
+    svg.append("g").attr("class","grid").attr("transform",`translate(0,${height})`).call(d3.axisBottom(xS).tickSize(-height).tickFormat(""));
+    svg.append("g").attr("class","grid").call(d3.axisLeft(yS).tickSize(-width).tickFormat(""));
+    svg.append("g").attr("class","axis").attr("transform",`translate(0,${height})`).call(d3.axisBottom(xS).ticks(8).tickFormat(v=>v>=1000?`${(v/1000).toFixed(0)}k`:v));
+    svg.append("g").attr("class","axis").call(d3.axisLeft(yS).ticks(6).tickFormat(v=>v+"%"));
+
+    for(const sKey of keys){
+      const col=STRATEGIES[sKey].color;
+      // Solid line = bust + stop-loss exits combined; dashed = ruin only.
+      const solid=d3.line().x(d=>xS(d.hand)).y(d=>yS(d.exit_pct)).curve(d3.curveStepAfter);
+      const dashed=d3.line().x(d=>xS(d.hand)).y(d=>yS(d.ruin_pct)).curve(d3.curveStepAfter);
+      const p1=svg.append("path").datum(series[sKey]).attr("d",solid).attr("fill","none").attr("stroke",col).attr("stroke-width",2.2);
+      const p2=svg.append("path").datum(series[sKey]).attr("d",dashed).attr("fill","none").attr("stroke",col).attr("stroke-width",1.4).attr("opacity",0.55).attr("stroke-dasharray","4,3");
+      const totalLen=p1.node().getTotalLength();
+      p1.attr("stroke-dasharray",totalLen).attr("stroke-dashoffset",totalLen)
+        .transition().duration(900).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
+      p2.attr("opacity",0).transition().delay(400).duration(700).attr("opacity",0.55);
+    }
+
+    const tooltip=document.getElementById("tooltip");
+    const bisect=d3.bisector(d=>d.hand).left;
+    svg.append("rect").attr("width",width).attr("height",height).attr("fill","transparent")
+      .on("mousemove",function(event){
+        const [mx]=d3.pointer(event);
+        const xVal=xS.invert(mx);
+        let html=`<div style="color:#888;margin-bottom:4px;">Hand ${Math.round(xVal).toLocaleString()}</div>`;
+        for(const sKey of keys){
+          const arr=series[sKey];
+          const i=Math.max(0,Math.min(arr.length-1,bisect(arr,xVal,1)-1));
+          html+=`<div style="color:${STRATEGIES[sKey].color}">${STRATEGIES[sKey].name}: <b>${arr[i].exit_pct.toFixed(1)}%</b> exited <span style="color:#888">(${arr[i].ruin_pct.toFixed(1)}% ruin)</span></div>`;
+        }
+        tooltip.innerHTML=html;
+        tooltip.style.opacity=1;
+        tooltip.style.left=event.pageX+12+"px";
+        tooltip.style.top=event.pageY-20+"px";
+      })
+      .on("mouseleave",()=>{tooltip.style.opacity=0;});
+
+    const leg=document.createElement("div");
+    leg.className="legend";
+    for(const sKey of keys){
+      leg.innerHTML+=`<div class="legend-item"><div class="legend-swatch" style="background:${STRATEGIES[sKey].color}"></div>${STRATEGIES[sKey].name}</div>`;
+    }
+    leg.innerHTML+=`<div class="legend-item" style="color:#888"><div class="legend-swatch" style="background:#888"></div>Solid: any exit (ruin+SL)</div>`;
+    leg.innerHTML+=`<div class="legend-item" style="color:#888"><div class="legend-swatch" style="background:#888;opacity:0.55;background-image:repeating-linear-gradient(90deg,#888 0,#888 3px,transparent 3px,transparent 6px)"></div>Dashed: ruin only</div>`;
+    ruinWrap.appendChild(leg);
+  }
+
+  // ── Panel 3: Termination Timeline (per-strategy selector) ──────────────
+  const timelineWrap=document.createElement("div");
+  timelineWrap.className="chart-container";
+  const tlHeader=document.createElement("div");
+  tlHeader.className="chart-header";
+  const tlLbl=document.createElement("span");
+  tlLbl.className="chart-label";
+  tlLbl.textContent="TERMINATION TIMELINE  ·  ROW = ONE SIM, BAR LENGTH = HANDS LASTED";
+  tlHeader.appendChild(tlLbl);
+  const tlBtns=document.createElement("div");
+  tlBtns.className="dist-buttons";
+  tlHeader.appendChild(tlBtns);
+  timelineWrap.appendChild(tlHeader);
+  container.appendChild(timelineWrap);
+
+  const tlChart=document.createElement("div");
+  timelineWrap.appendChild(tlChart);
+
   let selKey=keys[0];
-
-  const headerEl=document.createElement("div");
-  headerEl.className="chart-header";
-  const lblEl=document.createElement("span");
-  lblEl.className="chart-label";
-  lblEl.textContent="FINAL BANKROLL DISTRIBUTION";
-  headerEl.appendChild(lblEl);
-  const btnsEl=document.createElement("div");
-  btnsEl.className="dist-buttons";
-  headerEl.appendChild(btnsEl);
-  wrap.appendChild(headerEl);
-
-  const chartArea=document.createElement("div");
-  chartArea.id="dist-chart-area";
-  wrap.appendChild(chartArea);
-
-  function renderBars(sKey){
+  function renderTimeline(sKey){
     selKey=sKey;
-    btnsEl.innerHTML="";
+    tlBtns.innerHTML="";
     for(const k of keys){
       const b=document.createElement("button");
       b.className="dist-btn"+(k===sKey?" active":"");
       b.style.borderColor=k===sKey?STRATEGIES[k].color:"";
       b.style.color=k===sKey?STRATEGIES[k].color:"";
       b.textContent=STRATEGIES[k].name;
-      b.onclick=()=>renderBars(k);
-      btnsEl.appendChild(b);
+      b.onclick=()=>renderTimeline(k);
+      tlBtns.appendChild(b);
     }
-    chartArea.innerHTML="";
+    tlChart.innerHTML="";
 
-    const runs=state.results[sKey].sims;
-    const finals=runs.map(r=>r.final_bankroll);
-    const min=Math.min(...finals),max=Math.max(...finals);
-    const range=max-min||1;
-    const numBins=Math.min(30,Math.max(10,Math.floor(runs.length/2)));
-    const binW=range/numBins;
-    const bins=Array.from({length:numBins},(_,i)=>({
-      x0:min+i*binW,x1:min+(i+1)*binW,count:0,profit:(min+i*binW+binW/2)>=state.sim.bankroll
-    }));
-    for(const f of finals){const idx=Math.min(Math.floor((f-min)/binW),numBins-1);bins[idx].count++;}
+    const outcomes=(state.results[sKey].summary.outcomes||[]).slice();
+    // Sort by outcome category, then by hands lasted (so bankruptcies cluster
+    // at the top sorted by how quickly they hit, profit at the bottom).
+    const order={ruined:0, stopped_loss:1, loss:2, break_even:3, profit:4, stopped_profit:5};
+    outcomes.sort((a,b)=>{
+      const oa=order[a.outcome]??9, ob=order[b.outcome]??9;
+      if(oa!==ob) return oa-ob;
+      return a.hands-b.hands;
+    });
+    const n=outcomes.length;
 
-    const margin={top:20,right:30,bottom:40,left:50};
-    const width=chartArea.clientWidth||wrap.clientWidth-40;
+    const margin={top:18,right:30,bottom:40,left:55};
+    const width=tlChart.clientWidth||timelineWrap.clientWidth-40;
     const w=width-margin.left-margin.right;
-    const h=300;
+    const rowH=Math.max(2, Math.min(7, Math.floor(280/Math.max(n,1))));
+    const h=Math.max(180, n*rowH);
 
-    const svg=d3.select(chartArea).append("svg").attr("width",w+margin.left+margin.right).attr("height",h+margin.top+margin.bottom)
+    const svg=d3.select(tlChart).append("svg")
+      .attr("width",w+margin.left+margin.right)
+      .attr("height",h+margin.top+margin.bottom)
       .append("g").attr("transform",`translate(${margin.left},${margin.top})`);
 
-    const x=d3.scaleBand().domain(bins.map((_,i)=>i)).range([0,w]).padding(0.15);
-    const yMax=d3.max(bins,d=>d.count);
-    const y=d3.scaleLinear().domain([0,yMax]).range([h,0]);
+    const x=d3.scaleLinear().domain([0,numH]).range([0,w]);
+    const yIdx=d3.scaleLinear().domain([0,Math.max(n,1)]).range([0,h]);
 
-    svg.append("g").attr("class","grid").call(d3.axisLeft(y).tickSize(-w).tickFormat(""));
+    svg.append("g").attr("class","grid").attr("transform",`translate(0,${h})`)
+      .call(d3.axisBottom(x).tickSize(-h).tickFormat(""));
     svg.append("g").attr("class","axis").attr("transform",`translate(0,${h})`)
-      .call(d3.axisBottom(x).tickValues(bins.map((_,i)=>i).filter((_,i)=>i%(Math.ceil(numBins/8))===0))
-        .tickFormat(i=>`$${Math.round(bins[i].x0).toLocaleString()}`));
-    svg.append("g").attr("class","axis").call(d3.axisLeft(y).ticks(5));
+      .call(d3.axisBottom(x).ticks(8).tickFormat(v=>v>=1000?`${(v/1000).toFixed(0)}k`:v));
+    svg.append("g").attr("class","axis")
+      .call(d3.axisLeft(yIdx).ticks(5).tickFormat(d=>Math.round(d)));
 
-    const col=STRATEGIES[sKey].color;
-    svg.selectAll(".bar").data(bins).enter().append("rect")
-      .attr("x",(_,i)=>x(i)).attr("width",x.bandwidth())
-      .attr("y",h).attr("height",0)
-      .attr("rx",3)
-      .attr("fill",d=>d.profit?col:"#ef535088")
-      .transition().duration(600).ease(d3.easeCubicOut)
-      .attr("y",d=>y(d.count)).attr("height",d=>h-y(d.count));
+    svg.selectAll(".trow").data(outcomes).enter().append("rect")
+      .attr("class","trow")
+      .attr("x",0)
+      .attr("y",(_,i)=>yIdx(i)+0.5)
+      .attr("width",d=>Math.max(2,x(d.hands)))
+      .attr("height",Math.max(1,rowH-1))
+      .attr("fill",d=>OUTCOME_META[d.outcome]?.color||"#666")
+      .attr("opacity",0.85);
 
-    // Legend
-    const leg=document.createElement("div");
-    leg.style.cssText="text-align:center;margin-top:10px;font:11px var(--font-mono);color:#555";
-    leg.innerHTML=`<span style="color:#ef5350">■</span> Loss &nbsp;&nbsp; <span style="color:${col}">■</span> Profit`;
-    chartArea.appendChild(leg);
+    // Endpoint markers — small darker tip showing exit point.
+    svg.selectAll(".tend").data(outcomes).enter().append("rect")
+      .attr("class","tend")
+      .attr("x",d=>Math.max(0,x(d.hands)-2))
+      .attr("y",(_,i)=>yIdx(i))
+      .attr("width",3).attr("height",Math.max(2,rowH))
+      .attr("fill",d=>OUTCOME_META[d.outcome]?.color||"#fff");
+
+    // Axis labels
+    svg.append("text").attr("x",w/2).attr("y",h+34).attr("text-anchor","middle")
+      .attr("fill","#666").attr("font-family","Space Mono,monospace").attr("font-size","10px")
+      .text("Hand");
+    svg.append("text").attr("transform","rotate(-90)").attr("x",-h/2).attr("y",-40)
+      .attr("text-anchor","middle").attr("fill","#666")
+      .attr("font-family","Space Mono,monospace").attr("font-size","10px")
+      .text("Sim # (sorted by exit type)");
+
+    const tooltip=document.getElementById("tooltip");
+    svg.selectAll(".trow,.tend")
+      .on("mousemove",function(event,d){
+        if(!d) return;
+        const profitTxt=d.final>=state.sim.bankroll?`+$${(d.final-state.sim.bankroll).toLocaleString()}`:`-$${(state.sim.bankroll-d.final).toLocaleString()}`;
+        tooltip.innerHTML=`<div style="color:${OUTCOME_META[d.outcome]?.color||'#fff'};font-weight:700">${OUTCOME_META[d.outcome]?.label||d.outcome}</div><div style="color:#aaa">Lasted ${d.hands.toLocaleString()} of ${numH.toLocaleString()} hands</div><div style="color:#aaa">Final: $${d.final.toLocaleString()} (${profitTxt})</div>`;
+        tooltip.style.opacity=1;
+        tooltip.style.left=event.pageX+12+"px";
+        tooltip.style.top=event.pageY-30+"px";
+      })
+      .on("mouseleave",()=>{tooltip.style.opacity=0;});
+
+    // Summary chip strip below chart.
+    const counts=Object.fromEntries(OUTCOME_ORDER.map(o=>[o,0]));
+    for(const o of outcomes) if(counts[o.outcome]!==undefined) counts[o.outcome]++;
+    const ruinedDurations=outcomes.filter(o=>o.outcome==="ruined").map(o=>o.hands);
+    const medianRuin=ruinedDurations.length?ruinedDurations[Math.floor(ruinedDurations.length/2)]:null;
+    const bp=counts.ruined+counts.stopped_loss;
+    const pp=counts.profit+counts.stopped_profit;
+    const summary=document.createElement("div");
+    summary.style.cssText="margin-top:10px;font:11px var(--font-mono);display:flex;gap:14px;justify-content:center;flex-wrap:wrap;align-items:center;";
+    summary.innerHTML=
+      `<span style="color:#aaa">Total: <b style="color:#ddd">${n}</b></span>`+
+      OUTCOME_ORDER.filter(o=>counts[o]>0).map(o=>`<span style="color:${OUTCOME_META[o].color}">${OUTCOME_META[o].label}: <b>${counts[o]}</b></span>`).join("")+
+      `<span style="color:${bp>pp?'#ef5350':(bp<pp?'#66bb6a':'#888')}">B:P ratio <b>${bp}:${pp}</b></span>`+
+      (medianRuin!=null?`<span style="color:#ef5350">Median bust hand: <b>${medianRuin.toLocaleString()}</b></span>`:`<span style="color:#66bb6a">No bust events</span>`);
+    tlChart.appendChild(summary);
   }
-
-  renderBars(selKey);
+  renderTimeline(selKey);
 }
 
 // ── Survival & Profit-Probability Curves ──
@@ -1336,6 +1580,7 @@ function renderStats(){
     <th>Std Dev</th>
     <th>Min</th><th>Max</th>
     <th ${tip("Maximum drawdown — largest % decline from a running peak bankroll, averaged across sims. Always 0–100%.")}>Max DD</th>
+    <th ${tip("Average number of hands the player actually got to play before the run ended (ruin, stop-loss, take-profit, or session end). For ruin-prone strategies this is the 'how soon does the wheel come off?' number.")}>Avg Survival</th>
     <th>Status</th>
   </tr></thead><tbody>`;
   for(const sKey of sortedKeys){
@@ -1361,6 +1606,11 @@ function renderStats(){
       <td style="color:#ef535088">${fmtK(s.min)}</td>
       <td style="color:#66bb6a88">${fmtK(s.max)}</td>
       <td style="color:#ffa726">${(s.avg_max_drawdown*100).toFixed(1)}%</td>
+      <td>
+        <div style="font-weight:700">${(s.avg_hands_lasted||state.sim.hands).toLocaleString()}</div>
+        <div style="font:9px var(--font-mono);color:#666">of ${state.sim.hands.toLocaleString()} planned</div>
+        ${s.median_ruin_hand!=null?`<div style="font:9px var(--font-mono);color:#ef5350;margin-top:2px">ruin@~${s.median_ruin_hand.toLocaleString()}</div>`:""}
+      </td>
       <td><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:${profitColor};box-shadow:0 0 8px ${profitColor}66"></span></td>
     </tr>`;
     // MIT team — render an inline per-role mini-row underneath.
@@ -1374,7 +1624,7 @@ function renderStats(){
         const c=pl>=0?"var(--green)":"var(--red)";
         return `<span style="color:${m2.color};font-weight:700">${m2.label}</span> ${fmtK(v)} <span style="color:${c};font-size:10px">(${pl>=0?"+":""}${fmtK(pl)})</span>`;
       };
-      html+=`<tr><td colspan="11" style="padding:4px 10px 14px;font:11px var(--font-mono);color:#777;border-bottom:1px solid var(--border)">
+      html+=`<tr><td colspan="12" style="padding:4px 10px 14px;font:11px var(--font-mono);color:#777;border-bottom:1px solid var(--border)">
         ↳ ${cell("spotter")} &nbsp;·&nbsp; ${cell("controller")} &nbsp;·&nbsp; ${cell("big_player")} &nbsp;·&nbsp;
         BP play rate: <span style="color:${MIT_ROLE_META.big_player.color};font-weight:700">${((s.avg_bp_play_rate||0)*100).toFixed(1)}%</span>
       </td></tr>`;
@@ -1621,6 +1871,390 @@ function renderTeam(){
       .attr("y1",yPos-dy.bandwidth()*0.45).attr("y2",yPos+dy.bandwidth()*0.45)
       .attr("stroke",col).attr("stroke-width",3);
   }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HYPERPARAMETER SWEEP
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Re-runs lightweight sims across a range of values for a single hyperparameter,
+// holding everything else at the current sidebar settings. Charts profit-chance,
+// ruin%, median final, and EV/hand for every active strategy across the sweep.
+//
+// Cost is O(strategies × points × simsPerPoint × handsPerPoint). Default is
+// 50 sims × 1500 hands per data point per strategy — about a medium burn.
+
+const SWEEP_PARAMS = {
+  decks:       { label:"Deck Count",          values:[1,2,3,4,5,6,7,8],
+                 fmt:v=>v+"d", apply:v=>{state.settings.decks=v;}, restore:v=>{state.settings.decks=v;}, current:()=>state.settings.decks },
+  max_bet:     { label:"Table Max Bet",       values:[50,100,250,500,1000,2500,5000,10000],
+                 fmt:v=>v===Infinity?"∞":(v>=1000?`$${v/1000}k`:`$${v}`),
+                 apply:v=>{state.settings.tableMax=v;}, restore:v=>{state.settings.tableMax=v;}, current:()=>state.settings.tableMax,
+                 toggle:{label:"No Max Bet (∞)",appendValue:Infinity} },
+  bankroll:    { label:"Starting Bankroll",   values:[500,1000,2500,5000,10000,25000,50000,100000],
+                 fmt:v=>v===Infinity?"∞":(v>=1000?`$${v/1000}k`:`$${v}`),
+                 apply:v=>{state.sim.bankroll=v;}, restore:v=>{state.sim.bankroll=v;}, current:()=>state.sim.bankroll,
+                 toggle:{label:"Infinite Bankroll",appendValue:1e9} },
+  min_bet:     { label:"Table Min Bet",       values:[5,10,15,25,50,100,200],
+                 fmt:v=>`$${v}`, apply:v=>{state.settings.tableMin=v;}, restore:v=>{state.settings.tableMin=v;}, current:()=>state.settings.tableMin },
+  penetration: { label:"Shoe Penetration",    values:[40,50,60,70,75,80,85,90],
+                 fmt:v=>`${v}%`, apply:v=>{state.settings.penetration=v;}, restore:v=>{state.settings.penetration=v;}, current:()=>state.settings.penetration },
+};
+
+const SWEEP_METRICS = [
+  { key:"profit_chance", label:"Profit Chance",     unit:"%", color:"#66bb6a", fmt:v=>v.toFixed(1)+"%" },
+  { key:"ruin",          label:"Ruin Rate",         unit:"%", color:"#ef5350", fmt:v=>v.toFixed(1)+"%" },
+  { key:"median",        label:"Median Final $",    unit:"$", color:"#d4a843", fmt:v=>"$"+Math.round(v).toLocaleString() },
+  { key:"ev",            label:"EV per Hand",       unit:"$", color:"#26c6da", fmt:v=>"$"+v.toFixed(2) },
+];
+
+function renderSweep(){
+  const container=document.getElementById("view-sweep");
+  container.innerHTML="";
+
+  // ── Controls panel ──
+  const controls=document.createElement("div");
+  controls.className="chart-container";
+  controls.style.cssText="margin-bottom:14px;padding:14px 16px;";
+  container.appendChild(controls);
+
+  controls.innerHTML=`<div class="chart-header"><span class="chart-label">HYPERPARAMETER SWEEP</span><span class="chart-label">${state.activeStrategies.size} STRATEGIES × ${state.sweep.simsPerPoint} SIMS × ${state.sweep.handsPerPoint} HANDS</span></div>`;
+
+  const grid=document.createElement("div");
+  grid.style.cssText="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:10px;";
+  controls.appendChild(grid);
+
+  // Param selector
+  const paramBlock=document.createElement("div");
+  paramBlock.innerHTML=`<div style="font:10px var(--font-mono);color:var(--text-muted);letter-spacing:1px;margin-bottom:6px">SWEEP PARAMETER</div>`;
+  const paramSel=document.createElement("select");
+  paramSel.style.cssText="width:100%;padding:7px 9px;background:var(--bg-elevated);border:1px solid var(--border);color:var(--text-primary);font:12px var(--font-mono);border-radius:4px;";
+  for(const k in SWEEP_PARAMS){
+    const opt=document.createElement("option");
+    opt.value=k; opt.textContent=SWEEP_PARAMS[k].label;
+    if(k===state.sweep.param) opt.selected=true;
+    paramSel.appendChild(opt);
+  }
+  paramSel.onchange=()=>{ state.sweep.param=paramSel.value; renderSweep(); };
+  paramBlock.appendChild(paramSel);
+  grid.appendChild(paramBlock);
+
+  // Sims-per-point
+  const simsBlock=document.createElement("div");
+  simsBlock.innerHTML=`<div style="font:10px var(--font-mono);color:var(--text-muted);letter-spacing:1px;margin-bottom:6px">SIMS PER POINT: <span style="color:var(--gold)">${state.sweep.simsPerPoint}</span></div>`;
+  const simsRange=document.createElement("input");
+  simsRange.type="range"; simsRange.min=10; simsRange.max=200; simsRange.step=10; simsRange.value=state.sweep.simsPerPoint;
+  simsRange.style.width="100%";
+  simsRange.oninput=()=>{ state.sweep.simsPerPoint=+simsRange.value; renderSweep(); };
+  simsBlock.appendChild(simsRange);
+  grid.appendChild(simsBlock);
+
+  // Hands-per-sim
+  const handsBlock=document.createElement("div");
+  handsBlock.innerHTML=`<div style="font:10px var(--font-mono);color:var(--text-muted);letter-spacing:1px;margin-bottom:6px">HANDS PER SIM: <span style="color:var(--gold)">${state.sweep.handsPerPoint.toLocaleString()}</span></div>`;
+  const handsRange=document.createElement("input");
+  handsRange.type="range"; handsRange.min=200; handsRange.max=5000; handsRange.step=100; handsRange.value=state.sweep.handsPerPoint;
+  handsRange.style.width="100%";
+  handsRange.oninput=()=>{ state.sweep.handsPerPoint=+handsRange.value; renderSweep(); };
+  handsBlock.appendChild(handsRange);
+  grid.appendChild(handsBlock);
+
+  // Per-param toggles (No Max Bet, Infinite Bankroll)
+  const param=SWEEP_PARAMS[state.sweep.param];
+  if(param.toggle){
+    const togBlock=document.createElement("div");
+    const isOn=(state.sweep.param==="max_bet"&&state.sweep.noMaxBet)||(state.sweep.param==="bankroll"&&state.sweep.infiniteBankroll);
+    togBlock.innerHTML=`<div style="font:10px var(--font-mono);color:var(--text-muted);letter-spacing:1px;margin-bottom:6px">EXTRA POINT</div>`;
+    const togBtn=document.createElement("button");
+    togBtn.style.cssText=`width:100%;padding:7px 9px;background:${isOn?'var(--gold)':'var(--bg-elevated)'};border:1px solid ${isOn?'var(--gold)':'var(--border)'};color:${isOn?'var(--bg-primary)':'var(--text-primary)'};font:11px var(--font-mono);border-radius:4px;cursor:pointer;letter-spacing:0.5px;`;
+    togBtn.textContent=`${isOn?'✓ ':''}${param.toggle.label}`;
+    togBtn.onclick=()=>{
+      if(state.sweep.param==="max_bet") state.sweep.noMaxBet=!state.sweep.noMaxBet;
+      else if(state.sweep.param==="bankroll") state.sweep.infiniteBankroll=!state.sweep.infiniteBankroll;
+      renderSweep();
+    };
+    togBlock.appendChild(togBtn);
+    grid.appendChild(togBlock);
+  }
+
+  // Run/clear buttons
+  const buttonRow=document.createElement("div");
+  buttonRow.style.cssText="display:flex;gap:10px;margin-top:14px;";
+  controls.appendChild(buttonRow);
+
+  const totalPoints=getSweepValues(state.sweep.param).length;
+  const totalSims=totalPoints*state.sweep.simsPerPoint*state.activeStrategies.size;
+  const cost=document.createElement("div");
+  cost.style.cssText="flex:1;font:10px var(--font-mono);color:var(--text-muted);align-self:center;letter-spacing:0.5px;";
+  cost.innerHTML=`Total work: <b style="color:var(--text-secondary)">${totalPoints} points</b> × ${state.sweep.simsPerPoint} sims × ${state.activeStrategies.size} strategies = <b style="color:var(--gold)">${totalSims.toLocaleString()}</b> sims`;
+  buttonRow.appendChild(cost);
+
+  if(state.sweep.results){
+    const clearBtn=document.createElement("button");
+    clearBtn.className="btn";
+    clearBtn.textContent="CLEAR";
+    clearBtn.onclick=()=>{ state.sweep.results=null; renderSweep(); };
+    buttonRow.appendChild(clearBtn);
+  }
+
+  const runBtn=document.createElement("button");
+  runBtn.className="btn btn-gold";
+  runBtn.id="sweep-run-btn";
+  runBtn.textContent=state.sweep.running?`SWEEPING... ${Math.round(state.sweep.progress*100)}%`:"RUN SWEEP";
+  runBtn.disabled=state.sweep.running||state.activeStrategies.size===0;
+  runBtn.onclick=()=>runSweep();
+  buttonRow.appendChild(runBtn);
+
+  // ── Results ──
+  if(!state.sweep.results){
+    const placeholder=document.createElement("div");
+    placeholder.className="chart-container";
+    placeholder.style.cssText="text-align:center;padding:50px 20px;color:var(--text-muted);font:12px var(--font-mono);";
+    placeholder.innerHTML=`<div style="font-size:40px;opacity:0.18;margin-bottom:14px">⚙</div>Pick a parameter, set the budget, hit RUN SWEEP.<br><span style="opacity:0.7">Each point holds all other settings at their current sidebar values.</span>`;
+    container.appendChild(placeholder);
+    return;
+  }
+  renderSweepCharts(container);
+}
+
+function getSweepValues(paramKey){
+  const param=SWEEP_PARAMS[paramKey];
+  const values=[...param.values];
+  if(paramKey==="max_bet" && state.sweep.noMaxBet) values.push(param.toggle.appendValue);
+  if(paramKey==="bankroll" && state.sweep.infiniteBankroll) values.push(param.toggle.appendValue);
+  return values;
+}
+
+function runSweep(){
+  if(state.sweep.running) return;
+  if(state.activeStrategies.size===0) return;
+  state.sweep.running=true;
+  state.sweep.progress=0;
+  state.sweep.results=null;
+  renderSweep();
+
+  const param=SWEEP_PARAMS[state.sweep.param];
+  const values=getSweepValues(state.sweep.param);
+  const strategies=[...state.activeStrategies];
+  const numSims=state.sweep.simsPerPoint;
+  const numHands=state.sweep.handsPerPoint;
+
+  // Save originals — sweep mutates state.settings/sim.
+  const orig={
+    decks:state.settings.decks, tableMin:state.settings.tableMin, tableMax:state.settings.tableMax,
+    penetration:state.settings.penetration,
+    bankroll:state.sim.bankroll, hands:state.sim.hands, sims:state.sim.sims,
+  };
+
+  const points=[];
+  let pIdx=0;
+
+  function runPoint(){
+    if(pIdx>=values.length){
+      // Restore everything and finish.
+      state.settings.decks=orig.decks;
+      state.settings.tableMin=orig.tableMin;
+      state.settings.tableMax=orig.tableMax;
+      state.settings.penetration=orig.penetration;
+      state.sim.bankroll=orig.bankroll;
+      state.sim.hands=orig.hands;
+      state.sim.sims=orig.sims;
+      state.sweep.running=false;
+      state.sweep.progress=1;
+      state.sweep.results={ param:state.sweep.param, points, paramLabel:param.label, fmt:param.fmt };
+      renderSweep();
+      return;
+    }
+    const v=values[pIdx];
+    param.apply(v);
+    state.sim.hands=numHands;
+    const startB=state.sim.bankroll;
+
+    const perStrategy={};
+    for(const sKey of strategies){
+      const sims=[];
+      for(let i=0;i<numSims;i++){
+        sims.push(simulate(sKey,false));
+      }
+      const finals=sims.map(s=>s.final_bankroll).sort((a,b)=>a-b);
+      const n=finals.length;
+      const median=finals[Math.floor(n/2)];
+      const ruin=sims.filter(s=>s.ruined).length/n*100;
+      const profitChance=sims.filter(s=>s.final_bankroll>startB).length/n*100;
+      const totalProfit=finals.reduce((a,f)=>a+(f-startB),0);
+      const totalHands=sims.reduce((a,s)=>a+Math.max(s.hands_played||numHands,1),0);
+      const ev=totalProfit/Math.max(totalHands,1);
+      perStrategy[sKey]={ profit_chance:profitChance, ruin, median, ev };
+    }
+    points.push({ x:v, label:param.fmt(v), perStrategy });
+    pIdx++;
+    state.sweep.progress=pIdx/values.length;
+    // Update only the run button text without rebuilding the whole panel.
+    const btn=document.getElementById("sweep-run-btn");
+    if(btn) btn.textContent=`SWEEPING... ${Math.round(state.sweep.progress*100)}%`;
+    setTimeout(runPoint, 5); // yield to event loop so the spinner updates
+  }
+  setTimeout(runPoint, 30);
+}
+
+function renderSweepCharts(container){
+  const r=state.sweep.results;
+  const strategies=Object.keys(r.points[0].perStrategy);
+  const xValues=r.points.map(p=>p.x);
+  const isNumeric=xValues.every(v=>typeof v==="number" && isFinite(v));
+  // Treat the "infinite" sentinel point separately if appended.
+  const finitePoints=r.points.filter(p=>p.x!==Infinity && p.x<1e8);
+  const infinitePoint=r.points.find(p=>p.x===Infinity || p.x>=1e8);
+
+  const grid=document.createElement("div");
+  grid.style.cssText="display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:14px;";
+  container.appendChild(grid);
+
+  for(const metric of SWEEP_METRICS){
+    const wrap=document.createElement("div");
+    wrap.className="chart-container";
+    wrap.innerHTML=`<div class="chart-header"><span class="chart-label">${metric.label.toUpperCase()}</span><span class="chart-label">vs ${r.paramLabel.toUpperCase()}</span></div>`;
+    grid.appendChild(wrap);
+
+    const margin={top:18,right:30,bottom:42,left:64};
+    const width=420-margin.left-margin.right;
+    const height=220;
+    const svg=d3.select(wrap).append("svg")
+      .attr("width",width+margin.left+margin.right)
+      .attr("height",height+margin.top+margin.bottom)
+      .append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+
+    const useLog=(r.param==="bankroll"||r.param==="max_bet"||r.param==="min_bet");
+    const xDomain=finitePoints.map(p=>p.x);
+    let xS;
+    if(useLog && finitePoints.length){
+      const xMin=Math.min(...xDomain), xMax=Math.max(...xDomain);
+      xS=d3.scaleLog().domain([xMin,xMax]).range([0,width]);
+    } else {
+      xS=d3.scalePoint().domain(finitePoints.map(p=>p.label)).range([0,width]).padding(0.5);
+    }
+
+    let yMin=Infinity, yMax=-Infinity;
+    for(const p of r.points){
+      for(const sKey of strategies){
+        const v=p.perStrategy[sKey][metric.key];
+        if(v<yMin) yMin=v;
+        if(v>yMax) yMax=v;
+      }
+    }
+    if(metric.key==="profit_chance"||metric.key==="ruin"){ yMin=0; yMax=Math.max(yMax,5); }
+    if(yMin===yMax){ yMin-=1; yMax+=1; }
+    const yPad=(yMax-yMin)*0.08;
+    const yS=d3.scaleLinear().domain([yMin-yPad, yMax+yPad]).range([height,0]);
+
+    svg.append("g").attr("class","grid").attr("transform",`translate(0,${height})`)
+      .call((useLog?d3.axisBottom(xS).ticks(6,d3.format("~s")):d3.axisBottom(xS)).tickSize(-height).tickFormat(""));
+    svg.append("g").attr("class","grid").call(d3.axisLeft(yS).tickSize(-width).tickFormat(""));
+
+    const xAxis=useLog
+      ? d3.axisBottom(xS).ticks(6).tickFormat(v=>{const p=finitePoints.find(pt=>pt.x===v);return p?p.label:r.fmt(v);})
+      : d3.axisBottom(xS);
+    svg.append("g").attr("class","axis").attr("transform",`translate(0,${height})`).call(xAxis);
+    svg.append("g").attr("class","axis").call(d3.axisLeft(yS).ticks(5).tickFormat(metric.unit==="%"?(v=>v.toFixed(0)+"%"):(metric.unit==="$"?(v=>v>=1000?`$${(v/1000).toFixed(1)}k`:`$${v.toFixed(0)}`):d3.format("~g"))));
+
+    // Reference line at y=0 for EV/hand
+    if(metric.key==="ev"){
+      svg.append("line").attr("x1",0).attr("x2",width)
+        .attr("y1",yS(0)).attr("y2",yS(0))
+        .attr("stroke","#888").attr("stroke-dasharray","4,3").attr("opacity",0.5);
+    }
+
+    for(const sKey of strategies){
+      const col=STRATEGIES[sKey].color;
+      const lineFn=d3.line()
+        .x(p=>useLog?xS(p.x):xS(p.label))
+        .y(p=>yS(p.perStrategy[sKey][metric.key]))
+        .curve(d3.curveMonotoneX);
+      const path=svg.append("path").datum(finitePoints).attr("d",lineFn).attr("fill","none").attr("stroke",col).attr("stroke-width",2);
+      const totalLen=path.node().getTotalLength();
+      path.attr("stroke-dasharray",totalLen).attr("stroke-dashoffset",totalLen)
+        .transition().duration(700).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
+      // Dots
+      svg.selectAll(`.dot-${sKey.replace(/\W/g,'_')}`).data(finitePoints).enter().append("circle")
+        .attr("cx",p=>useLog?xS(p.x):xS(p.label))
+        .attr("cy",p=>yS(p.perStrategy[sKey][metric.key]))
+        .attr("r",3).attr("fill",col).attr("opacity",0).transition().delay(400).duration(400).attr("opacity",1);
+      // Infinity marker
+      if(infinitePoint){
+        svg.append("circle")
+          .attr("cx",width-5).attr("cy",yS(infinitePoint.perStrategy[sKey][metric.key]))
+          .attr("r",4).attr("fill",col).attr("stroke","#fff").attr("stroke-width",1).attr("opacity",0.95);
+      }
+    }
+    if(infinitePoint){
+      svg.append("text").attr("x",width-5).attr("y",height+24)
+        .attr("text-anchor","end").attr("fill","#888")
+        .attr("font-family","Space Mono,monospace").attr("font-size","9px")
+        .text("∞ →");
+    }
+
+    // Tooltip
+    const tooltip=document.getElementById("tooltip");
+    svg.append("rect").attr("width",width).attr("height",height).attr("fill","transparent")
+      .on("mousemove",function(event){
+        const [mx]=d3.pointer(event);
+        let nearest=finitePoints[0], minDist=Infinity;
+        for(const p of finitePoints){
+          const px=useLog?xS(p.x):xS(p.label);
+          const d=Math.abs(px-mx);
+          if(d<minDist){ minDist=d; nearest=p; }
+        }
+        if(infinitePoint && Math.abs((width-5)-mx)<minDist) nearest=infinitePoint;
+        let html=`<div style="color:#888;margin-bottom:4px;">${r.paramLabel}: <b style="color:#ddd">${nearest.label}</b></div>`;
+        for(const sKey of strategies){
+          const v=nearest.perStrategy[sKey][metric.key];
+          html+=`<div style="color:${STRATEGIES[sKey].color}">${STRATEGIES[sKey].name}: <b>${metric.fmt(v)}</b></div>`;
+        }
+        tooltip.innerHTML=html;
+        tooltip.style.opacity=1;
+        tooltip.style.left=event.pageX+12+"px";
+        tooltip.style.top=event.pageY-20+"px";
+      })
+      .on("mouseleave",()=>{tooltip.style.opacity=0;});
+  }
+
+  // Legend
+  const leg=document.createElement("div");
+  leg.className="legend";
+  leg.style.marginTop="12px";
+  for(const sKey of strategies){
+    leg.innerHTML+=`<div class="legend-item"><div class="legend-swatch" style="background:${STRATEGIES[sKey].color}"></div>${STRATEGIES[sKey].name}</div>`;
+  }
+  container.appendChild(leg);
+
+  // Summary table — best/worst at each metric.
+  const summary=document.createElement("div");
+  summary.className="chart-container";
+  summary.style.marginTop="14px";
+  summary.innerHTML=`<div class="chart-header"><span class="chart-label">SWEEP RANGE  ·  ${r.paramLabel.toUpperCase()}: ${r.points[0].label} → ${r.points[r.points.length-1].label}</span></div>`;
+  const sTable=document.createElement("table");
+  sTable.style.cssText="width:100%;border-collapse:collapse;margin-top:8px;font:11px var(--font-mono);";
+  let head=`<thead><tr style="text-align:left;color:var(--text-muted);border-bottom:1px solid var(--border);"><th style="padding:6px 8px">Strategy</th>`;
+  for(const m of SWEEP_METRICS) head+=`<th style="padding:6px 8px">${m.label} range</th>`;
+  head+=`</tr></thead>`;
+  sTable.innerHTML=head;
+  const tbody=document.createElement("tbody");
+  for(const sKey of strategies){
+    const row=document.createElement("tr");
+    row.style.borderBottom="1px solid var(--border)";
+    let cells=`<td style="padding:8px;color:${STRATEGIES[sKey].color};font-weight:700">${STRATEGIES[sKey].name}</td>`;
+    for(const m of SWEEP_METRICS){
+      const vals=r.points.map(p=>p.perStrategy[sKey][m.key]);
+      const lo=Math.min(...vals), hi=Math.max(...vals);
+      cells+=`<td style="padding:8px;color:var(--text-secondary)">${m.fmt(lo)} → <b style="color:var(--text-primary)">${m.fmt(hi)}</b></td>`;
+    }
+    row.innerHTML=cells;
+    tbody.appendChild(row);
+  }
+  sTable.appendChild(tbody);
+  summary.appendChild(sTable);
+  container.appendChild(summary);
 }
 
 
