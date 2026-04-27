@@ -375,7 +375,9 @@
   <div class="header-right">
     <button class="btn active" id="tab-bankroll" onclick="switchTab('bankroll')">BANKROLL</button>
     <button class="btn" id="tab-distribution" onclick="switchTab('distribution')">DISTRIBUTION</button>
+    <button class="btn" id="tab-survival" onclick="switchTab('survival')">SURVIVAL</button>
     <button class="btn" id="tab-stats" onclick="switchTab('stats')">STATS</button>
+    <button class="btn" id="tab-team" onclick="switchTab('team')">MIT TEAM</button>
     <button class="btn" id="tab-live" onclick="switchTab('live')">LIVE</button>
     <button class="btn btn-gold" id="run-btn" onclick="runSimulation()">RUN SIMULATION</button>
   </div>
@@ -392,6 +394,10 @@
       <div id="sim-settings-container"></div>
     </div>
     <div class="section">
+      <div class="section-title">RISK CONTROLS</div>
+      <div id="risk-controls-container"></div>
+    </div>
+    <div class="section">
       <div class="section-title">BETTING STRATEGIES</div>
       <div id="strategies-container"></div>
     </div>
@@ -403,7 +409,9 @@
     </div>
     <div id="view-bankroll" style="display:none;"></div>
     <div id="view-distribution" style="display:none;"></div>
+    <div id="view-survival" style="display:none;"></div>
     <div id="view-stats" style="display:none;"></div>
+    <div id="view-team" style="display:none;"></div>
     <div id="view-live" style="display:none;"></div>
   </div>
 </div>
@@ -422,13 +430,25 @@ const STRATEGIES = {
   oneThreeTwoSix:  { name: "1-3-2-6",   color: "#ffa726", desc: "Bet 1→3→2→6 units on consecutive wins." },
   oscar:           { name: "Oscar's Grind", color: "#ab47bc", desc: "Raise by 1 unit after a win; reset when cycle profits 1 unit." },
   hilo:            { name: "Hi-Lo Count",   color: "#26c6da", desc: "Bet proportional to the Hi-Lo true count." },
+  hilo_cheat:      { name: "Hi-Lo (Cheating)", color: "#ffd54f", desc: "Same play as Hi-Lo, but knows the EXACT true count at all times — bets on a much steeper ramp." },
+  mit_team:        { name: "MIT Team", color: "#e040fb", desc: "3-person team: Spotter counts, Controller verifies, Big Player swoops on hot shoes." },
 };
 
 const HILO_TAGS = {2:1,3:1,4:1,5:1,6:1,7:0,8:0,9:0,10:-1,J:-1,Q:-1,K:-1,A:-1};
 
+// MIT Team display palette — used by the team-breakdown chart.
+const MIT_ROLE_META = {
+  spotter:    { label: "Spotter",    color: "#4fc3f7" },
+  controller: { label: "Controller", color: "#66bb6a" },
+  big_player: { label: "Big Player", color: "#e040fb" },
+  combined:   { label: "Team Total", color: "#ffd54f" },
+};
+
 let state = {
   settings: { decks:6, penetration:75, tableMin:25, tableMax:5000, bjPays:"3:2", dealerS17:true },
   sim: { bankroll:10000, hands:2000, sims:50 },
+  // Risk controls. null = disabled.
+  risk: { stopLossPct: null, takeProfitPct: null },
   activeStrategies: new Set(["flat","martingale","hilo"]),
   results: null,
   currentTab: "bankroll",
@@ -520,6 +540,19 @@ function playHand(shoe){
   return {net,pCards:pHands.length===1?pHands[0].cards:pHands.flatMap(h=>h.cards),dCards:d,pt:pHands.length===1?pHands[0].total:0,dt,bj:false,doubled:pHands.some(h=>h.doubled),allCards};
 }
 
+// ── Cheating Hi-Lo helper ──
+// The cheater "knows" the true count perfectly at every moment. We simulate
+// that by reading the running count straight off the cards still in the shoe
+// (this gives the same value as a flawless mental tally — but with no risk
+// of a real-world miscount and no warm-up needed).
+function exactRunningCount(shoe){
+  let rc=0;
+  for(let i=shoe.idx;i<shoe.cards.length;i++){
+    rc -= (HILO_TAGS[shoe.cards[i]]||0);
+  }
+  return rc;
+}
+
 // ── Betting strategy state machines ──
 function initBet(key){
   switch(key){
@@ -529,6 +562,7 @@ function initBet(key){
     case "oneThreeTwoSix": return {step:0};
     case "oscar": return {bet:1,profit:0};
     case "hilo": return {rc:0};
+    case "hilo_cheat": return {rc:0};
   }
 }
 function getBet(key,bs,tmin){
@@ -539,6 +573,16 @@ function getBet(key,bs,tmin){
     case "oneThreeTwoSix": return tmin*[1,3,2,6][bs.step];
     case "oscar": return tmin*bs.bet;
     case "hilo": {const tc=bs.rc/Math.max(1,bs._dr||4);if(tc<=1)return tmin;if(tc<=2)return tmin*2;if(tc<=3)return tmin*4;if(tc<=4)return tmin*8;return tmin*12;}
+    case "hilo_cheat": {
+      // Aggressive ramp — the cheater knows EV.
+      const tc=bs.rc/Math.max(1,bs._dr||4);
+      if(tc<=0) return tmin;
+      if(tc<=1) return tmin*4;
+      if(tc<=2) return tmin*12;
+      if(tc<=3) return tmin*25;
+      if(tc<=4) return tmin*40;
+      return tmin*60;
+    }
   }
 }
 function updateBet(key,bs,won,allCards){
@@ -548,34 +592,57 @@ function updateBet(key,bs,won,allCards){
     case "paroli": {let w=won?Math.min(bs.wins+1,2):0;if(bs.wins>=2&&won)w=0;return {wins:w};}
     case "oneThreeTwoSix": return {step:won?Math.min(bs.step+1,3):0};
     case "oscar": {let nb=bs.bet,np=bs.profit;if(won){np+=bs.bet;nb=bs.bet+1;}else{np-=bs.bet;}if(np>=1)return{bet:1,profit:0};return{bet:Math.max(1,nb),profit:np};}
-    case "hilo": {let rc=bs.rc;if(allCards) for(const c of allCards) rc+=(HILO_TAGS[c]||0);return{rc};}
+    case "hilo":
+    case "hilo_cheat": {let rc=bs.rc;if(allCards) for(const c of allCards) rc+=(HILO_TAGS[c]||0);return{rc};}
   }
 }
 
 // ── Full simulation ──
 function simulate(sKey, recordHands){
+  if(sKey==="mit_team") return simulateMitTeam(recordHands);
+
   const {decks,penetration,tableMin,tableMax,bjPays}=state.settings;
   const {bankroll:startB,hands:numH}=state.sim;
-  let shoe=createShoe(decks), bankroll=startB, maxB=startB, maxDD=0, ruined=false;
+  const {stopLossPct,takeProfitPct}=state.risk;
+  const slThreshold=(stopLossPct!=null && stopLossPct>0) ? startB*(1 - stopLossPct/100) : null;
+  const tpThreshold=(takeProfitPct!=null && takeProfitPct>0) ? startB*(1 + takeProfitPct/100) : null;
+  let shoe=createShoe(decks), bankroll=startB, maxB=startB, maxDD=0;
+  let ruined=false, stoppedLoss=false, stoppedProfit=false, handsPlayed=0;
   let bs=initBet(sKey);
   const bjMult=bjPays==="3:2"?1.5:1.2;
+  const isCount=(sKey==="hilo"||sKey==="hilo_cheat");
+  const isCheat=(sKey==="hilo_cheat");
   const sampleInterval=Math.max(1,Math.floor(numH/800));
   const history=[{hand:0,bankroll}];
   const hands=[];
   let wins=0,losses=0,pushes=0,bjs=0;
 
   for(let h=0;h<numH;h++){
-    if(shoeNeedsReshuffle(shoe)){shoe=createShoe(decks);if(sKey==="hilo")bs={rc:0};}
-    if(bankroll<=0){ruined=true;break;}
-    if(shoe.cards.length-shoe.idx<15){shoe=createShoe(decks);if(sKey==="hilo")bs={rc:0};}
-    if(sKey==="hilo") bs._dr=shoeDecksRemaining(shoe);
+    if(shoeNeedsReshuffle(shoe)){shoe=createShoe(decks);if(isCount)bs={rc:0};}
+    if(shoe.cards.length-shoe.idx<15){shoe=createShoe(decks);if(isCount)bs={rc:0};}
+    if(isCount) bs._dr=shoeDecksRemaining(shoe);
+    if(isCheat) bs.rc=exactRunningCount(shoe);
     let rawBet=getBet(sKey,bs,tableMin);
-    let bet=Math.min(Math.max(rawBet,tableMin),tableMax,bankroll);
+    // What the strategy *requires* this round, floored at the table min.
+    const nextRequiredBet=Math.max(rawBet, tableMin);
+
+    // ── Ruin check ── can the player legally bet what their strategy demands?
+    if(bankroll < tableMin || nextRequiredBet > tableMax || bankroll < nextRequiredBet){
+      ruined=true; break;
+    }
+    // ── Stop-loss / take-profit gates ──
+    if(slThreshold!==null && bankroll <= slThreshold){ stoppedLoss=true; break; }
+    if(tpThreshold!==null && bankroll >= tpThreshold){ stoppedProfit=true; break; }
+
+    const bet=nextRequiredBet;  // guards passed
     const r=playHand(shoe);
+    handsPlayed++;
     const payout=r.bj&&r.net>0?bet*bjMult:r.net*bet;
     bankroll=Math.round((bankroll+payout)*100)/100;
     maxB=Math.max(maxB,bankroll);
-    const dd=maxB>0?(maxB-bankroll)/maxB:0;
+    const floorBR=Math.max(bankroll,0);
+    let dd=maxB>0?(maxB-floorBR)/maxB:0;
+    dd=Math.max(0, Math.min(1, dd));   // clamp to [0,1]
     maxDD=Math.max(maxDD,dd);
     const won=r.net>0;
     let label="push";
@@ -585,17 +652,202 @@ function simulate(sKey, recordHands){
     if(h%sampleInterval===0||h===numH-1) history.push({hand:h+1,bankroll});
     if(recordHands) hands.push({hand_num:h+1,bankroll,bet:Math.round(bet*100)/100,net:Math.round(payout*100)/100,
       player_cards:r.pCards,dealer_cards:r.dCards,player_total:r.pt,dealer_total:r.dt,result:label,
-      running_count:sKey==="hilo"?bs.rc:undefined,true_count:sKey==="hilo"?Math.round(bs.rc/shoeDecksRemaining(shoe)*100)/100:undefined});
+      running_count:isCount?bs.rc:undefined,true_count:isCount?Math.round(bs.rc/shoeDecksRemaining(shoe)*100)/100:undefined});
+  }
+  // Anchor final bankroll on history so curves can read it.
+  if(history[history.length-1].hand !== handsPlayed){
+    history.push({hand:handsPlayed, bankroll});
   }
   const total=wins+losses+pushes+bjs;
-  return {history,hands,final_bankroll:bankroll,max_drawdown:Math.round(maxDD*1e4)/1e4,ruined,
+  return {history,hands,final_bankroll:bankroll,max_drawdown:Math.round(maxDD*1e4)/1e4,
+    ruined, stopped_loss:stoppedLoss, stopped_profit:stoppedProfit, hands_played:handsPlayed,
     stats:{total_hands:total,wins,losses,pushes,blackjacks:bjs,win_rate:Math.round((wins+bjs)/Math.max(total,1)*1e4)/1e4}};
+}
+
+// ── MIT Team simulation (3 actors, shared shoe) ──
+function simulateMitTeam(recordHands){
+  const {decks,tableMin,tableMax,bjPays}=state.settings;
+  const {bankroll:startB,hands:numH}=state.sim;
+  const bjMult=bjPays==="3:2"?1.5:1.2;
+  let shoe=createShoe(decks);
+  let runningCount=0;
+
+  // Each role gets 1/3 of the team bankroll.
+  const roleBR={spotter:startB/3, controller:startB/3, big_player:startB/3};
+  let maxTeam=startB, maxDD=0;
+  let ruined=false, stoppedLoss=false, stoppedProfit=false, handsPlayed=0;
+  const {stopLossPct,takeProfitPct}=state.risk;
+  const slThreshold=(stopLossPct!=null && stopLossPct>0) ? startB*(1 - stopLossPct/100) : null;
+  const tpThreshold=(takeProfitPct!=null && takeProfitPct>0) ? startB*(1 + takeProfitPct/100) : null;
+
+  const sampleInterval=Math.max(1,Math.floor(numH/800));
+  const history=[{
+    hand:0,
+    bankroll:startB,
+    spotter:roleBR.spotter, controller:roleBR.controller, big_player:roleBR.big_player
+  }];
+  const hands=[];
+
+  let bpW=0,bpL=0,bpP=0,bpBJ=0,bpDoubles=0,bpHandsPlayed=0;
+  let spotW=0,spotL=0,ctrlW=0,ctrlL=0;
+
+  function safeReshuffle(){ shoe=createShoe(decks); runningCount=0; }
+  function resolve(role, bet){
+    if(shoeNeedsReshuffle(shoe) || (shoe.cards.length-shoe.idx)<15) safeReshuffle();
+    const r=playHand(shoe);
+    for(const c of r.allCards) runningCount+=(HILO_TAGS[c]||0);
+    const payout=r.bj && r.net>0 ? bet*bjMult : r.net*bet;
+    roleBR[role]=Math.round((roleBR[role]+payout)*100)/100;
+    return {payout, r};
+  }
+
+  for(let h=0;h<numH;h++){
+    if(shoeNeedsReshuffle(shoe)) safeReshuffle();
+    let teamBR=roleBR.spotter+roleBR.controller+roleBR.big_player;
+    if(teamBR < tableMin || teamBR<=0){ruined=true;break;}
+    if(slThreshold!==null && teamBR <= slThreshold){ stoppedLoss=true; break; }
+    if(tpThreshold!==null && teamBR >= tpThreshold){ stoppedProfit=true; break; }
+    handsPlayed++;
+
+    // ── Spotter: flat table_min ──
+    const spotBet=Math.min(tableMin, Math.max(roleBR.spotter,0));
+    let spotPay=0, spotRes=null;
+    if(spotBet>0){
+      const out=resolve("spotter", spotBet);
+      spotPay=out.payout; spotRes=out.r;
+      if(spotPay>0) spotW++;
+      else if(spotPay<0) spotL++;
+    }
+
+    let tcMid=runningCount/shoeDecksRemaining(shoe);
+
+    // ── Controller: 1×–4× depending on count ──
+    let ctrlMult=1;
+    if(tcMid>=3) ctrlMult=4;
+    else if(tcMid>=2) ctrlMult=3;
+    else if(tcMid>=1) ctrlMult=2;
+    const ctrlBet=Math.min(tableMin*ctrlMult, tableMax, Math.max(roleBR.controller,0));
+    let ctrlPay=0, ctrlRes=null;
+    if(ctrlBet>0){
+      const out=resolve("controller", ctrlBet);
+      ctrlPay=out.payout; ctrlRes=out.r;
+      if(ctrlPay>0) ctrlW++;
+      else if(ctrlPay<0) ctrlL++;
+    }
+
+    let tcAfter=runningCount/shoeDecksRemaining(shoe);
+
+    // ── Big Player: only joins when TC ≥ +2, then bets HUGE ──
+    let bpPay=0, bpRes=null, bpBet=0, bpLabel="scout";
+    if(tcAfter>=2 && roleBR.big_player>0){
+      let bpMult;
+      if(tcAfter>=5) bpMult=60;
+      else if(tcAfter>=4) bpMult=40;
+      else if(tcAfter>=3) bpMult=25;
+      else bpMult=15;
+      bpBet=Math.min(tableMin*bpMult, tableMax, roleBR.big_player);
+      const out=resolve("big_player", bpBet);
+      bpPay=out.payout; bpRes=out.r;
+      bpHandsPlayed++;
+      if(bpRes.net>0){
+        if(bpRes.bj){bpBJ++; bpLabel="blackjack";}
+        else{bpW++; bpLabel="win";}
+      } else if(bpRes.net<0){bpL++; bpLabel="loss";}
+      else{bpP++; bpLabel="push";}
+      if(bpRes.doubled) bpDoubles++;
+    }
+
+    teamBR=roleBR.spotter+roleBR.controller+roleBR.big_player;
+    maxTeam=Math.max(maxTeam, teamBR);
+    if(maxTeam>0){
+      const floorBR=Math.max(teamBR,0);
+      let dd=(maxTeam-floorBR)/maxTeam;
+      dd=Math.max(0, Math.min(1, dd));
+      maxDD=Math.max(maxDD,dd);
+    }
+
+    if(h%sampleInterval===0||h===numH-1){
+      history.push({
+        hand:h+1, bankroll:Math.round(teamBR*100)/100,
+        spotter:Math.round(roleBR.spotter*100)/100,
+        controller:Math.round(roleBR.controller*100)/100,
+        big_player:Math.round(roleBR.big_player*100)/100,
+      });
+    }
+
+    if(recordHands){
+      const dispRes=bpRes||ctrlRes||spotRes;
+      const dispBet=bpRes?bpBet:(ctrlRes?ctrlBet:spotBet);
+      const dispActor=bpRes?"big_player":(ctrlRes?"controller":"spotter");
+      hands.push({
+        hand_num:h+1,
+        bankroll:Math.round(teamBR*100)/100,
+        bet:Math.round(dispBet*100)/100,
+        net:Math.round((spotPay+ctrlPay+bpPay)*100)/100,
+        result: bpRes?bpLabel:(ctrlRes||spotRes?"active":"scout"),
+        player_cards: dispRes?dispRes.pCards:[],
+        dealer_cards: dispRes?dispRes.dCards:[],
+        player_total: dispRes?dispRes.pt:0,
+        dealer_total: dispRes?dispRes.dt:0,
+        running_count: runningCount,
+        true_count: Math.round(runningCount/shoeDecksRemaining(shoe)*100)/100,
+        active_actor: dispActor,
+        bp_active: bpRes!==null,
+        spotter_br:Math.round(roleBR.spotter*100)/100,
+        controller_br:Math.round(roleBR.controller*100)/100,
+        big_player_br:Math.round(roleBR.big_player*100)/100,
+        spotter_bet:Math.round(spotBet*100)/100,
+        controller_bet:Math.round(ctrlBet*100)/100,
+        big_player_bet:Math.round(bpBet*100)/100,
+        spotter_pl:Math.round(spotPay*100)/100,
+        controller_pl:Math.round(ctrlPay*100)/100,
+        big_player_pl:Math.round(bpPay*100)/100,
+      });
+    }
+  }
+
+  const bpTotal=bpW+bpL+bpP+bpBJ;
+  const finalTeam=roleBR.spotter+roleBR.controller+roleBR.big_player;
+  // Anchor final team total in history.
+  if(history[history.length-1].hand !== handsPlayed){
+    history.push({
+      hand: handsPlayed,
+      bankroll: Math.round(finalTeam*100)/100,
+      spotter: Math.round(roleBR.spotter*100)/100,
+      controller: Math.round(roleBR.controller*100)/100,
+      big_player: Math.round(roleBR.big_player*100)/100,
+    });
+  }
+  return {
+    history, hands,
+    final_bankroll: Math.round(finalTeam*100)/100,
+    team_breakdown: {
+      spotter: Math.round(roleBR.spotter*100)/100,
+      controller: Math.round(roleBR.controller*100)/100,
+      big_player: Math.round(roleBR.big_player*100)/100,
+    },
+    max_drawdown: Math.round(maxDD*1e4)/1e4,
+    ruined,
+    stopped_loss: stoppedLoss,
+    stopped_profit: stoppedProfit,
+    hands_played: handsPlayed,
+    stats:{
+      total_hands: bpTotal, wins:bpW, losses:bpL, pushes:bpP, blackjacks:bpBJ,
+      win_rate: Math.round((bpW+bpBJ)/Math.max(bpTotal,1)*1e4)/1e4,
+      bp_hands_played: bpHandsPlayed,
+      bp_play_rate: Math.round(bpHandsPlayed/Math.max(numH,1)*1e4)/1e4,
+      spotter_record:{wins:spotW,losses:spotL},
+      controller_record:{wins:ctrlW,losses:ctrlL},
+    }
+  };
 }
 
 function runSimulation(){
   const btn=document.getElementById("run-btn");
   btn.disabled=true; btn.textContent="SIMULATING...";
   setTimeout(()=>{
+    const startB=state.sim.bankroll;
+    const numH=state.sim.hands;
     const results={};
     for(const sKey of state.activeStrategies){
       const sims=[];
@@ -607,15 +859,118 @@ function runSimulation(){
         sims.push(r);
       }
       const finals=sims.map(s=>s.final_bankroll).sort((a,b)=>a-b);
-      const n=finals.length,mean=finals.reduce((a,b)=>a+b,0)/n;
+      const n=finals.length;
+      const mean=finals.reduce((a,b)=>a+b,0)/n;
       const variance=finals.reduce((a,b)=>a+(b-mean)**2,0)/n;
-      results[sKey]={meta:STRATEGIES[sKey],sims,live_hands:liveHands,
-        summary:{mean:Math.round(mean*100)/100,median:finals[Math.floor(n/2)],
-          std:Math.round(Math.sqrt(variance)*100)/100,min:finals[0],max:finals[n-1],
-          p10:finals[Math.floor(n*0.1)],p90:finals[Math.floor(n*0.9)],
-          ruin_rate:Math.round(sims.filter(s=>s.ruined).length/n*1e4)/1e4,
-          avg_max_drawdown:Math.round(sims.reduce((a,s)=>a+s.max_drawdown,0)/n*1e4)/1e4,
-          roi:Math.round((mean-state.sim.bankroll)/state.sim.bankroll*1e4)/100}};
+      const median=finals[Math.floor(n/2)];
+      const pctOf=(arr,p)=>{ if(!arr.length) return 0; const i=Math.max(0,Math.min(arr.length-1,Math.round(p*(arr.length-1)))); return arr[i]; };
+      const ruinRate=sims.filter(s=>s.ruined).length/n;
+      const slRate=sims.filter(s=>s.stopped_loss).length/n;
+      const tpRate=sims.filter(s=>s.stopped_profit).length/n;
+      const avgDD=sims.reduce((a,s)=>a+s.max_drawdown,0)/n;
+      const profitChance=sims.filter(s=>s.final_bankroll>startB).length/n;
+      const totalProfit=finals.reduce((a,f)=>a+(f-startB),0);
+      const totalHandsPlayed=sims.reduce((a,s)=>a+Math.max(s.hands_played||numH,1),0);
+      const evPerHand=totalProfit/Math.max(totalHandsPlayed,1);
+
+      // ── Survival & profit-probability curves + percentile bands ──
+      const NPOINTS=60;
+      const grid=[]; for(let i=0;i<=NPOINTS;i++) grid.push(Math.round(numH*i/NPOINTS));
+      const bankrollAt=(hist,target)=>{
+        let br=hist[0].bankroll;
+        for(const pt of hist){ if(pt.hand<=target) br=pt.bankroll; else break; }
+        return br;
+      };
+      const reachedHand=(s,target)=>{
+        const lastHand=s.history[s.history.length-1].hand;
+        if(s.ruined) return lastHand>target;
+        return lastHand>=target;
+      };
+      const curves=[];
+      for(const target of grid){
+        let alive=0,inProfit=0;
+        const brs=[];
+        for(const s of sims){
+          const br=bankrollAt(s.history,target);
+          if(reachedHand(s,target)){
+            alive++;
+            brs.push(br);
+            if(br>startB) inProfit++;
+          } else {
+            brs.push(s.final_bankroll);
+            if(s.final_bankroll>startB) inProfit++;
+          }
+        }
+        brs.sort((a,b)=>a-b);
+        curves.push({
+          hand:target,
+          survival_pct:Math.round(alive/n*1e4)/100,
+          profit_chance_pct:Math.round(inProfit/n*1e4)/100,
+          median:Math.round(pctOf(brs,0.50)*100)/100,
+          p5:Math.round(pctOf(brs,0.05)*100)/100,
+          p25:Math.round(pctOf(brs,0.25)*100)/100,
+          p75:Math.round(pctOf(brs,0.75)*100)/100,
+          p95:Math.round(pctOf(brs,0.95)*100)/100,
+        });
+      }
+
+      // ── Color status ──
+      let colorStatus;
+      const medianAboveStart=median>startB;
+      if(profitChance>0.50 && medianAboveStart && ruinRate<0.10) colorStatus="green";
+      else if(ruinRate>=0.25 || !medianAboveStart || avgDD>=0.75) colorStatus="red";
+      else colorStatus="amber";
+
+      // ── Interpretation tags ──
+      const tags=[]; let warning=null;
+      if(ruinRate>=0.50) tags.push("Low survival");
+      if(mean>startB && median<=startB){ tags.push("Outlier-driven"); warning="Mean inflated by rare outliers"; }
+      const std=Math.sqrt(variance);
+      if(std>startB) tags.push("High volatility");
+      if(median<startB*0.95 && ruinRate<0.20) tags.push("Stable loser");
+      if(median>startB*1.05 && avgDD<0.30 && ruinRate<0.05) tags.push("Stable winner");
+      if(sKey==="hilo_cheat") tags.push("Cheating / invalid");
+
+      const summary={
+        mean:Math.round(mean*100)/100,
+        median:Math.round(median*100)/100,
+        std:Math.round(std*100)/100,
+        min:finals[0], max:finals[n-1],
+        p5:Math.round(pctOf(finals,0.05)*100)/100,
+        p10:Math.round(pctOf(finals,0.10)*100)/100,
+        p25:Math.round(pctOf(finals,0.25)*100)/100,
+        p75:Math.round(pctOf(finals,0.75)*100)/100,
+        p90:Math.round(pctOf(finals,0.90)*100)/100,
+        p95:Math.round(pctOf(finals,0.95)*100)/100,
+        ruin_rate:Math.round(ruinRate*1e4)/1e4,
+        stopped_loss_rate:Math.round(slRate*1e4)/1e4,
+        stopped_profit_rate:Math.round(tpRate*1e4)/1e4,
+        avg_max_drawdown:Math.round(avgDD*1e4)/1e4,
+        roi:Math.round((mean-startB)/startB*1e4)/100,
+        profit_chance_pct:Math.round(profitChance*1e4)/100,
+        ev_per_hand:Math.round(evPerHand*1e4)/1e4,
+        median_profit:Math.round((median-startB)*100)/100,
+        color_status:colorStatus,
+        tags,
+        warning,
+        curves,
+        finals:finals.map(f=>Math.round(f*100)/100),
+      };
+
+      // MIT team — collate per-role aggregate finals.
+      if(sKey==="mit_team"){
+        const roles=["spotter","controller","big_player"];
+        const tb={};
+        for(const role of roles){
+          const vals=sims.map(s=>(s.team_breakdown||{})[role]||0);
+          const m=vals.reduce((a,b)=>a+b,0)/vals.length;
+          tb[role]={mean:Math.round(m*100)/100, min:Math.round(Math.min(...vals)*100)/100, max:Math.round(Math.max(...vals)*100)/100};
+        }
+        summary.team_breakdown=tb;
+        const bpRates=sims.map(s=>s.stats.bp_play_rate||0);
+        summary.avg_bp_play_rate=Math.round(bpRates.reduce((a,b)=>a+b,0)/bpRates.length*1e4)/1e4;
+      }
+      results[sKey]={meta:STRATEGIES[sKey],sims,live_hands:liveHands,summary};
     }
     state.results=results;
     document.getElementById("empty-state").style.display="none";
@@ -630,7 +985,7 @@ function runSimulation(){
 
 function switchTab(tab){
   state.currentTab=tab;
-  ["bankroll","distribution","stats","live"].forEach(t=>{
+  ["bankroll","distribution","survival","stats","team","live"].forEach(t=>{
     document.getElementById(`tab-${t}`).classList.toggle("active",t===tab);
     document.getElementById(`view-${t}`).style.display=t===tab&&state.results?"block":"none";
   });
@@ -643,12 +998,16 @@ function renderCurrentTab(){
   switch(state.currentTab){
     case "bankroll": renderBankroll(); break;
     case "distribution": renderDistribution(); break;
+    case "survival": renderSurvival(); break;
     case "stats": renderStats(); break;
+    case "team": renderTeam(); break;
     case "live": renderLive(); break;
   }
 }
 
-// ── Bankroll Chart (D3) ──
+// ── Bankroll Chart (D3): MEDIAN line + p5/p95 percentile band ──
+// Shows the typical bankroll trajectory (median, NOT mean) along with the
+// 5th/95th percentile bands so heavy-tailed distributions don't visually mislead.
 function renderBankroll(){
   const container=document.getElementById("view-bankroll");
   container.innerHTML="";
@@ -658,7 +1017,7 @@ function renderBankroll(){
 
   const headerEl=document.createElement("div");
   headerEl.className="chart-header";
-  headerEl.innerHTML=`<span class="chart-label">BANKROLL OVER TIME</span><span class="chart-label">${state.sim.sims>1?"MEAN ± P10/P90 BANDS":"SINGLE RUN"}</span>`;
+  headerEl.innerHTML=`<span class="chart-label">BANKROLL OVER TIME</span><span class="chart-label">${state.sim.sims>1?"MEDIAN + P5/P95 BAND":"SINGLE RUN"}</span>`;
   wrap.appendChild(headerEl);
 
   const margin={top:20,right:30,bottom:40,left:65};
@@ -670,40 +1029,24 @@ function renderBankroll(){
     .attr("height",height+margin.top+margin.bottom)
     .append("g").attr("transform",`translate(${margin.left},${margin.top})`);
 
-  // Aggregate data
   const keys=[...state.activeStrategies];
-  const firstKey=keys[0], firstSim=state.results[firstKey];
-  if(!firstSim) return;
-  const len=firstSim.sims[0].history.length;
-  const data=[];
-  for(let i=0;i<len;i++){
-    const pt={hand:firstSim.sims[0].history[i].hand};
-    for(const sKey of keys){
-      const runs=state.results[sKey].sims;
-      const vals=runs.map(r=>r.history[Math.min(i,r.history.length-1)]?.bankroll??0);
-      const mean=vals.reduce((a,b)=>a+b,0)/vals.length;
-      const sorted=[...vals].sort((a,b)=>a-b);
-      pt[`${sKey}_mean`]=Math.round(mean);
-      pt[`${sKey}_p10`]=sorted[Math.floor(vals.length*0.1)]??sorted[0];
-      pt[`${sKey}_p90`]=sorted[Math.floor(vals.length*0.9)]??sorted[sorted.length-1];
+  if(!keys.length || !state.results[keys[0]]) return;
+
+  // Domain across all strategies
+  let yMin=Infinity, yMax=-Infinity, xMax=0;
+  for(const sKey of keys){
+    const c=state.results[sKey].summary.curves;
+    for(const pt of c){
+      yMin=Math.min(yMin, pt.p5);
+      yMax=Math.max(yMax, pt.p95);
+      xMax=Math.max(xMax, pt.hand);
     }
-    data.push(pt);
   }
+  const x=d3.scaleLinear().domain([0,xMax]).range([0,width]);
+  const y=d3.scaleLinear().domain([Math.max(0,yMin*0.9), yMax*1.05]).range([height,0]);
 
-  // Scales
-  let yMin=Infinity,yMax=-Infinity;
-  for(const d of data) for(const k of keys){
-    yMin=Math.min(yMin,d[`${k}_p10`]??d[`${k}_mean`]);
-    yMax=Math.max(yMax,d[`${k}_p90`]??d[`${k}_mean`]);
-  }
-  const x=d3.scaleLinear().domain([0,data[data.length-1].hand]).range([0,width]);
-  const y=d3.scaleLinear().domain([Math.max(0,yMin*0.9),yMax*1.05]).range([height,0]);
-
-  // Grid
   svg.append("g").attr("class","grid").attr("transform",`translate(0,${height})`).call(d3.axisBottom(x).tickSize(-height).tickFormat(""));
   svg.append("g").attr("class","grid").call(d3.axisLeft(y).tickSize(-width).tickFormat(""));
-
-  // Axes
   svg.append("g").attr("class","axis").attr("transform",`translate(0,${height})`)
     .call(d3.axisBottom(x).ticks(8).tickFormat(v=>v>=1000?`${(v/1000).toFixed(0)}k`:v));
   svg.append("g").attr("class","axis")
@@ -712,35 +1055,36 @@ function renderBankroll(){
   // Reference line at starting bankroll
   svg.append("line").attr("x1",0).attr("x2",width)
     .attr("y1",y(state.sim.bankroll)).attr("y2",y(state.sim.bankroll))
-    .attr("stroke","#d4a843").attr("stroke-dasharray","6,4").attr("stroke-width",1).attr("opacity",0.3);
+    .attr("stroke","#d4a843").attr("stroke-dasharray","6,4").attr("stroke-width",1).attr("opacity",0.45);
 
-  // Bands + lines
+  // Bands + median lines
   for(const sKey of keys){
     const col=STRATEGIES[sKey].color;
+    const c=state.results[sKey].summary.curves;
     if(state.sim.sims>1){
-      const area=d3.area().x(d=>x(d.hand)).y0(d=>y(d[`${sKey}_p10`])).y1(d=>y(d[`${sKey}_p90`])).curve(d3.curveMonotoneX);
-      svg.append("path").datum(data).attr("d",area).attr("fill",col).attr("opacity",0.1);
+      const area=d3.area().x(d=>x(d.hand)).y0(d=>y(d.p5)).y1(d=>y(d.p95)).curve(d3.curveMonotoneX);
+      svg.append("path").datum(c).attr("d",area).attr("fill",col).attr("opacity",0.12);
     }
-    const line=d3.line().x(d=>x(d.hand)).y(d=>y(d[`${sKey}_mean`])).curve(d3.curveMonotoneX);
-    const path=svg.append("path").datum(data).attr("d",line).attr("fill","none").attr("stroke",col).attr("stroke-width",2.5);
-    // Animate
+    const line=d3.line().x(d=>x(d.hand)).y(d=>y(d.median)).curve(d3.curveMonotoneX);
+    const path=svg.append("path").datum(c).attr("d",line).attr("fill","none").attr("stroke",col).attr("stroke-width",2.5);
     const totalLen=path.node().getTotalLength();
     path.attr("stroke-dasharray",totalLen).attr("stroke-dashoffset",totalLen)
       .transition().duration(1200).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
   }
 
-  // Tooltip overlay
+  // Tooltip
   const tooltip=document.getElementById("tooltip");
   const bisect=d3.bisector(d=>d.hand).left;
   svg.append("rect").attr("width",width).attr("height",height).attr("fill","transparent")
     .on("mousemove",function(event){
       const [mx]=d3.pointer(event);
       const xVal=x.invert(mx);
-      const i=bisect(data,xVal,1);
-      const d=data[i]||data[data.length-1];
-      let html=`<div style="color:#888;margin-bottom:4px;">Hand ${d.hand.toLocaleString()}</div>`;
+      let html=`<div style="color:#888;margin-bottom:4px;">Hand ${Math.round(xVal).toLocaleString()}</div>`;
       for(const sKey of keys){
-        html+=`<div style="color:${STRATEGIES[sKey].color}">${STRATEGIES[sKey].name}: $${d[`${sKey}_mean`].toLocaleString()}</div>`;
+        const c=state.results[sKey].summary.curves;
+        const i=bisect(c,xVal,1);
+        const d=c[i]||c[c.length-1];
+        html+=`<div style="color:${STRATEGIES[sKey].color}">${STRATEGIES[sKey].name}: <b>$${Math.round(d.median).toLocaleString()}</b> <span style="color:#666">(p5 $${Math.round(d.p5).toLocaleString()} – p95 $${Math.round(d.p95).toLocaleString()})</span></div>`;
       }
       tooltip.innerHTML=html;
       tooltip.style.opacity=1;
@@ -749,12 +1093,12 @@ function renderBankroll(){
     })
     .on("mouseleave",()=>{tooltip.style.opacity=0;});
 
-  // Legend
   const legend=document.createElement("div");
   legend.className="legend";
   for(const sKey of keys){
     legend.innerHTML+=`<div class="legend-item"><div class="legend-swatch" style="background:${STRATEGIES[sKey].color}"></div>${STRATEGIES[sKey].name}</div>`;
   }
+  legend.innerHTML+=`<div class="legend-item" style="color:#888"><div class="legend-swatch" style="background:#888;opacity:0.3"></div>P5–P95 band</div>`;
   wrap.appendChild(legend);
 }
 
@@ -846,7 +1190,102 @@ function renderDistribution(){
   renderBars(selKey);
 }
 
+// ── Survival & Profit-Probability Curves ──
+// Two stacked time-series. Survival = % of sims still alive at hand h.
+// Profit-prob = % of sims with bankroll > start at hand h. Together they tell
+// a much more honest story than ROI for high-risk progression strategies:
+// e.g. Oscar's Grind grinds up to a small profit *most* of the time, but a
+// chunk of runs vaporise the bankroll long before the end of the session.
+function renderSurvival(){
+  const container=document.getElementById("view-survival");
+  container.innerHTML="";
+
+  const keys=[...state.activeStrategies];
+  if(!keys.length) return;
+
+  function makeChart(metric, title, axisLabel){
+    const wrap=document.createElement("div");
+    wrap.className="chart-container";
+    wrap.style.marginBottom="14px";
+    wrap.innerHTML=`<div class="chart-header"><span class="chart-label">${title}</span><span class="chart-label">% OF SIMULATIONS</span></div>`;
+    container.appendChild(wrap);
+
+    const margin={top:20,right:30,bottom:40,left:60};
+    const width=wrap.clientWidth-margin.left-margin.right-40;
+    const height=260;
+
+    const svg=d3.select(wrap).append("svg")
+      .attr("width",width+margin.left+margin.right)
+      .attr("height",height+margin.top+margin.bottom)
+      .append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+
+    let xMax=0;
+    for(const sKey of keys){
+      const c=state.results[sKey].summary.curves;
+      xMax=Math.max(xMax, c[c.length-1].hand);
+    }
+    const x=d3.scaleLinear().domain([0,xMax]).range([0,width]);
+    const y=d3.scaleLinear().domain([0,100]).range([height,0]);
+
+    svg.append("g").attr("class","grid").attr("transform",`translate(0,${height})`).call(d3.axisBottom(x).tickSize(-height).tickFormat(""));
+    svg.append("g").attr("class","grid").call(d3.axisLeft(y).tickSize(-width).tickFormat(""));
+    svg.append("g").attr("class","axis").attr("transform",`translate(0,${height})`)
+      .call(d3.axisBottom(x).ticks(8).tickFormat(v=>v>=1000?`${(v/1000).toFixed(0)}k`:v));
+    svg.append("g").attr("class","axis").call(d3.axisLeft(y).ticks(5).tickFormat(v=>v+"%"));
+
+    // 50% reference line (only meaningful for profit chance)
+    if(metric==="profit_chance_pct"){
+      svg.append("line").attr("x1",0).attr("x2",width).attr("y1",y(50)).attr("y2",y(50))
+        .attr("stroke","#d4a843").attr("stroke-dasharray","6,4").attr("opacity",0.4);
+    }
+
+    for(const sKey of keys){
+      const c=state.results[sKey].summary.curves;
+      const col=STRATEGIES[sKey].color;
+      const line=d3.line().x(d=>x(d.hand)).y(d=>y(d[metric])).curve(d3.curveMonotoneX);
+      const path=svg.append("path").datum(c).attr("d",line).attr("fill","none").attr("stroke",col).attr("stroke-width",2.5);
+      const tl=path.node().getTotalLength();
+      path.attr("stroke-dasharray",tl).attr("stroke-dashoffset",tl)
+        .transition().duration(1100).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
+    }
+
+    const tooltip=document.getElementById("tooltip");
+    const bisect=d3.bisector(d=>d.hand).left;
+    svg.append("rect").attr("width",width).attr("height",height).attr("fill","transparent")
+      .on("mousemove",function(event){
+        const [mx]=d3.pointer(event);
+        const xv=x.invert(mx);
+        let html=`<div style="color:#888;margin-bottom:4px;">Hand ${Math.round(xv).toLocaleString()}</div>`;
+        for(const sKey of keys){
+          const c=state.results[sKey].summary.curves;
+          const i=bisect(c,xv,1);
+          const d=c[i]||c[c.length-1];
+          html+=`<div style="color:${STRATEGIES[sKey].color}">${STRATEGIES[sKey].name}: <b>${d[metric].toFixed(1)}%</b></div>`;
+        }
+        tooltip.innerHTML=html;
+        tooltip.style.opacity=1;
+        tooltip.style.left=event.pageX+12+"px";
+        tooltip.style.top=event.pageY-20+"px";
+      })
+      .on("mouseleave",()=>{tooltip.style.opacity=0;});
+
+    const legend=document.createElement("div");
+    legend.className="legend";
+    for(const sKey of keys){
+      legend.innerHTML+=`<div class="legend-item"><div class="legend-swatch" style="background:${STRATEGIES[sKey].color}"></div>${STRATEGIES[sKey].name}</div>`;
+    }
+    wrap.appendChild(legend);
+  }
+
+  makeChart("survival_pct", "SURVIVAL CURVE — % OF SIMS STILL ALIVE", "Survival %");
+  makeChart("profit_chance_pct", "PROFIT PROBABILITY — % WITH BANKROLL > START", "Profit %");
+}
+
 // ── Stats Table ──
+// Survival-first ranking. Mean/ROI is intentionally NOT the primary signal —
+// median, profit chance, and ruin rate matter more for distributions with
+// fat right-tails (Martingale, Oscar's Grind etc.) where a few outlier wins
+// can drag the mean above zero while >90% of runs ended ruined.
 function renderStats(){
   const container=document.getElementById("view-stats");
   container.innerHTML="";
@@ -856,30 +1295,334 @@ function renderStats(){
 
   const lbl=document.createElement("span");
   lbl.className="chart-label";
-  lbl.textContent="STRATEGY COMPARISON";
+  lbl.textContent="STRATEGY COMPARISON — RANKED BY PROFIT CHANCE";
   wrap.appendChild(lbl);
 
-  const fmtK=v=>Math.abs(v)>=10000?`$${(v/1000).toFixed(0)}k`:`$${Math.round(v).toLocaleString()}`;
+  const fmtK=v=>{
+    const sgn=v<0?"-":""; const a=Math.abs(v);
+    return sgn+(a>=10000?`$${(a/1000).toFixed(0)}k`:`$${Math.round(a).toLocaleString()}`);
+  };
+  const colorFor=status=>status==="green"?"#66bb6a":status==="red"?"#ef5350":"#ffa726";
+  const tagBadge=tag=>{
+    const map={
+      "Low survival":      {bg:"rgba(239,83,80,0.18)", fg:"#ef5350"},
+      "Outlier-driven":    {bg:"rgba(255,167,38,0.18)", fg:"#ffa726"},
+      "High volatility":   {bg:"rgba(255,167,38,0.18)", fg:"#ffa726"},
+      "Stable loser":      {bg:"rgba(239,83,80,0.12)", fg:"#ef5350"},
+      "Stable winner":     {bg:"rgba(102,187,106,0.18)", fg:"#66bb6a"},
+      "Cheating / invalid":{bg:"rgba(255,213,79,0.18)", fg:"#ffd54f"},
+    };
+    const c=map[tag]||{bg:"#222", fg:"#888"};
+    return `<span style="display:inline-block;background:${c.bg};color:${c.fg};padding:2px 7px;border-radius:3px;font:600 9.5px var(--font-mono);letter-spacing:0.5px;margin:1px 2px 1px 0">${tag.toUpperCase()}</span>`;
+  };
+  // Tooltip helper — uses native title="" attribute so no extra JS plumbing.
+  const tip=text=>`title="${text.replace(/"/g,"&quot;")}"`;
+
+  // Sort by profit_chance_pct descending so the safest-by-profit-chance
+  // strategy is on top. Ruin / median / volatility break ties.
+  const sortedKeys=[...state.activeStrategies].sort((a,b)=>{
+    const sa=state.results[a]?.summary, sb=state.results[b]?.summary;
+    if(!sa) return 1; if(!sb) return -1;
+    return (sb.profit_chance_pct||0) - (sa.profit_chance_pct||0);
+  });
 
   let html=`<table class="stats-table"><thead><tr>
-    <th>Strategy</th><th>Mean</th><th>Median</th><th>Std Dev</th><th>Min</th><th>Max</th><th>Ruin %</th><th>Max DD</th>
+    <th>Strategy</th>
+    <th ${tip("Percent of simulations that finished above the starting bankroll. The headline 'did I win money?' metric.")}>Profit %</th>
+    <th ${tip("Percent of simulations where the player could no longer place a legal bet (bankroll < table min, or the strategy demanded more than the table max, or more than the bankroll could cover).")}>Ruin %</th>
+    <th ${tip("Final bankroll of the median (50th percentile) simulation. More robust than the mean for heavy-tailed payoff distributions.")}>Median</th>
+    <th>Mean</th>
+    <th ${tip("Average profit per hand actually played, across all simulations. Negative means the strategy bleeds money on every hand on average.")}>EV/Hand</th>
+    <th>Std Dev</th>
+    <th>Min</th><th>Max</th>
+    <th ${tip("Maximum drawdown — largest % decline from a running peak bankroll, averaged across sims. Always 0–100%.")}>Max DD</th>
+    <th>Status</th>
   </tr></thead><tbody>`;
-  for(const sKey of state.activeStrategies){
+  for(const sKey of sortedKeys){
     const d=state.results[sKey]; if(!d) continue;
     const s=d.summary, m=d.meta;
-    const roiColor=s.roi>=0?"var(--green)":"var(--red)";
-    html+=`<tr>
-      <td><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${m.color};margin-right:8px;vertical-align:middle"></span>${m.name}</td>
-      <td style="color:${roiColor}">${fmtK(s.mean)} <span style="font-size:10px;color:#666">(${s.roi>0?"+":""}${s.roi}%)</span></td>
-      <td>${fmtK(s.median)}</td><td>${fmtK(s.std)}</td>
-      <td style="color:#ef535088">${fmtK(s.min)}</td><td style="color:#66bb6a88">${fmtK(s.max)}</td>
-      <td style="color:${s.ruin_rate>0?"var(--red)":"var(--green)"}">${(s.ruin_rate*100).toFixed(1)}%</td>
+    const profitColor=colorFor(s.color_status);
+    const ruinColor=s.ruin_rate>=0.25?"var(--red)":s.ruin_rate>=0.10?"#ffa726":"var(--green)";
+    const medColor=s.median>state.sim.bankroll?"var(--green)":"var(--red)";
+    const meanRoiSuffix=`<span style="font-size:10px;color:#666">(${s.roi>0?"+":""}${s.roi}%)</span>`;
+    const tagsHTML=(s.tags||[]).map(tagBadge).join(" ");
+    const warningHTML=s.warning?`<div style="font:600 10px var(--font-mono);color:#ffa726;margin-top:3px">⚠ ${s.warning}</div>`:"";
+    html+=`<tr style="border-left:3px solid ${profitColor}">
+      <td>
+        <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${m.color};margin-right:8px;vertical-align:middle"></span>${m.name}
+        <div style="margin-top:6px">${tagsHTML}</div>${warningHTML}
+      </td>
+      <td style="color:${profitColor};font-weight:700">${(s.profit_chance_pct||0).toFixed(1)}%</td>
+      <td style="color:${ruinColor};font-weight:700">${(s.ruin_rate*100).toFixed(1)}%</td>
+      <td style="color:${medColor};font-weight:700">${fmtK(s.median)}</td>
+      <td>${fmtK(s.mean)} ${meanRoiSuffix}</td>
+      <td style="color:${(s.ev_per_hand||0)>=0?"var(--green)":"var(--red)"}">${(s.ev_per_hand||0)>=0?"+":""}$${(s.ev_per_hand||0).toFixed(3)}</td>
+      <td>${fmtK(s.std)}</td>
+      <td style="color:#ef535088">${fmtK(s.min)}</td>
+      <td style="color:#66bb6a88">${fmtK(s.max)}</td>
       <td style="color:#ffa726">${(s.avg_max_drawdown*100).toFixed(1)}%</td>
+      <td><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:${profitColor};box-shadow:0 0 8px ${profitColor}66"></span></td>
     </tr>`;
+    // MIT team — render an inline per-role mini-row underneath.
+    if(sKey==="mit_team" && s.team_breakdown){
+      const tb=s.team_breakdown;
+      const startThird=state.sim.bankroll/3;
+      const cell=role=>{
+        const m2=MIT_ROLE_META[role];
+        const v=tb[role].mean;
+        const pl=v-startThird;
+        const c=pl>=0?"var(--green)":"var(--red)";
+        return `<span style="color:${m2.color};font-weight:700">${m2.label}</span> ${fmtK(v)} <span style="color:${c};font-size:10px">(${pl>=0?"+":""}${fmtK(pl)})</span>`;
+      };
+      html+=`<tr><td colspan="11" style="padding:4px 10px 14px;font:11px var(--font-mono);color:#777;border-bottom:1px solid var(--border)">
+        ↳ ${cell("spotter")} &nbsp;·&nbsp; ${cell("controller")} &nbsp;·&nbsp; ${cell("big_player")} &nbsp;·&nbsp;
+        BP play rate: <span style="color:${MIT_ROLE_META.big_player.color};font-weight:700">${((s.avg_bp_play_rate||0)*100).toFixed(1)}%</span>
+      </td></tr>`;
+    }
   }
   html+=`</tbody></table>`;
-  wrap.innerHTML+=html;
+
+  // Risk-control summary banner (if SL/TP were applied)
+  let banner="";
+  const sl=state.risk.stopLossPct, tp=state.risk.takeProfitPct;
+  if(sl!=null || tp!=null){
+    banner=`<div style="margin-top:14px;padding:10px 14px;background:var(--bg-elevated);border-left:3px solid #d4a843;font:12px var(--font-mono);color:#aaa">
+      Risk controls active:
+      ${sl!=null?`<span style="color:#ef5350">stop-loss at -${sl}%</span>`:""}
+      ${(sl!=null && tp!=null)?" · ":""}
+      ${tp!=null?`<span style="color:#66bb6a">take-profit at +${tp}%</span>`:""}
+    </div>`;
+  }
+
+  // Color legend
+  const legend=`<div style="margin-top:14px;font:11px var(--font-mono);color:#888;line-height:1.7">
+    <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#66bb6a;vertical-align:middle;margin-right:6px"></span>Green: profit chance &gt; 50%, median &gt; start, ruin &lt; 10% &nbsp;·&nbsp;
+    <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#ffa726;vertical-align:middle;margin-right:6px"></span>Amber: mixed signals &nbsp;·&nbsp;
+    <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#ef5350;vertical-align:middle;margin-right:6px"></span>Red: ruin ≥ 25% OR median ≤ start OR drawdown ≥ 75%
+  </div>`;
+
+  wrap.innerHTML+=html+banner+legend;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MIT TEAM BREAKDOWN
+// ══════════════════════════════════════════════════════════════════════════════
+// Shows the per-actor P/L of the Spotter, Controller, and Big Player along
+// with their collated team total. Only meaningful when the MIT team strategy
+// is included in the simulation run.
+
+function renderTeam(){
+  const container=document.getElementById("view-team");
+  container.innerHTML="";
+
+  const data=state.results?.mit_team;
+  if(!data){
+    container.innerHTML=`
+      <div class="empty-state">
+        <div class="suits">♠ ♥ ♦ ♣</div>
+        <p>Enable the <b style="color:${MIT_ROLE_META.combined.color}">MIT Team</b> strategy in the sidebar and run a simulation to see the per-actor breakdown.</p>
+      </div>`;
+    return;
+  }
+
+  // ── Top wrapper: per-role bankroll over time chart ──
+  const wrap=document.createElement("div");
+  wrap.className="chart-container";
+  wrap.innerHTML=`
+    <div class="chart-header">
+      <span class="chart-label">TEAM P/L OVER TIME</span>
+      <span class="chart-label">${state.sim.sims>1?"FIRST RUN (per-actor lines)":"SINGLE RUN"}</span>
+    </div>`;
+  container.appendChild(wrap);
+
+  // Use the first simulation's history for per-role traces
+  // (they're per-run so we don't average them — averaging would smear the
+  // dramatic Big-Player swings flat).
+  const series=data.sims[0].history;
+  if(!series || series.length===0){
+    wrap.innerHTML+=`<p style="color:#888;font:12px var(--font-mono);padding:20px">No team history available.</p>`;
+  } else {
+    const margin={top:20,right:30,bottom:40,left:70};
+    const w=wrap.clientWidth-margin.left-margin.right-40;
+    const h=380;
+
+    const svg=d3.select(wrap).append("svg")
+      .attr("width",w+margin.left+margin.right)
+      .attr("height",h+margin.top+margin.bottom)
+      .append("g").attr("transform",`translate(${margin.left},${margin.top})`);
+
+    const roles=["spotter","controller","big_player"];
+    let yMin=Infinity, yMax=-Infinity;
+    for(const pt of series){
+      yMin=Math.min(yMin, pt.spotter, pt.controller, pt.big_player, pt.bankroll);
+      yMax=Math.max(yMax, pt.spotter, pt.controller, pt.big_player, pt.bankroll);
+    }
+
+    const x=d3.scaleLinear().domain([0, series[series.length-1].hand]).range([0,w]);
+    const y=d3.scaleLinear().domain([Math.min(0, yMin*0.9), yMax*1.05]).range([h,0]);
+
+    // Grid + axes
+    svg.append("g").attr("class","grid").attr("transform",`translate(0,${h})`).call(d3.axisBottom(x).tickSize(-h).tickFormat(""));
+    svg.append("g").attr("class","grid").call(d3.axisLeft(y).tickSize(-w).tickFormat(""));
+    svg.append("g").attr("class","axis").attr("transform",`translate(0,${h})`)
+      .call(d3.axisBottom(x).ticks(8).tickFormat(v=>v>=1000?`${(v/1000).toFixed(0)}k`:v));
+    svg.append("g").attr("class","axis")
+      .call(d3.axisLeft(y).ticks(7).tickFormat(v=>v>=10000?`$${(v/1000).toFixed(0)}k`:`$${Math.round(v).toLocaleString()}`));
+
+    // Reference line at starting per-role bankroll = startB/3
+    const startThird=state.sim.bankroll/3;
+    svg.append("line").attr("x1",0).attr("x2",w).attr("y1",y(startThird)).attr("y2",y(startThird))
+      .attr("stroke","#888").attr("stroke-dasharray","4,4").attr("opacity",0.35);
+    // Reference line for whole-team starting bankroll
+    svg.append("line").attr("x1",0).attr("x2",w).attr("y1",y(state.sim.bankroll)).attr("y2",y(state.sim.bankroll))
+      .attr("stroke",MIT_ROLE_META.combined.color).attr("stroke-dasharray","6,4").attr("opacity",0.4);
+
+    // Per-role lines
+    for(const role of roles){
+      const col=MIT_ROLE_META[role].color;
+      const line=d3.line().x(d=>x(d.hand)).y(d=>y(d[role])).curve(d3.curveMonotoneX);
+      const path=svg.append("path").datum(series).attr("d",line).attr("fill","none").attr("stroke",col).attr("stroke-width",2);
+      const tl=path.node().getTotalLength();
+      path.attr("stroke-dasharray",tl).attr("stroke-dashoffset",tl)
+        .transition().duration(1100).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
+    }
+    // Combined line — thicker, sits on top
+    const combinedLine=d3.line().x(d=>x(d.hand)).y(d=>y(d.bankroll)).curve(d3.curveMonotoneX);
+    const cp=svg.append("path").datum(series).attr("d",combinedLine).attr("fill","none")
+      .attr("stroke",MIT_ROLE_META.combined.color).attr("stroke-width",3.2);
+    const cl=cp.node().getTotalLength();
+    cp.attr("stroke-dasharray",cl).attr("stroke-dashoffset",cl)
+      .transition().duration(1400).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
+
+    // Hover overlay
+    const tooltip=document.getElementById("tooltip");
+    const bisect=d3.bisector(d=>d.hand).left;
+    svg.append("rect").attr("width",w).attr("height",h).attr("fill","transparent")
+      .on("mousemove",function(event){
+        const [mx]=d3.pointer(event);
+        const xv=x.invert(mx);
+        const i=bisect(series,xv,1);
+        const d=series[i]||series[series.length-1];
+        let html=`<div style="color:#888;margin-bottom:4px;">Hand ${d.hand.toLocaleString()}</div>`;
+        for(const role of roles){
+          const m=MIT_ROLE_META[role];
+          html+=`<div style="color:${m.color}">${m.label}: $${Math.round(d[role]).toLocaleString()}</div>`;
+        }
+        html+=`<div style="color:${MIT_ROLE_META.combined.color};margin-top:4px;border-top:1px solid #333;padding-top:4px">TEAM: $${Math.round(d.bankroll).toLocaleString()}</div>`;
+        tooltip.innerHTML=html;
+        tooltip.style.opacity=1;
+        tooltip.style.left=event.pageX+12+"px";
+        tooltip.style.top=event.pageY-20+"px";
+      })
+      .on("mouseleave",()=>{tooltip.style.opacity=0;});
+
+    // Legend
+    const legend=document.createElement("div");
+    legend.className="legend";
+    for(const role of roles){
+      const m=MIT_ROLE_META[role];
+      legend.innerHTML+=`<div class="legend-item"><div class="legend-swatch" style="background:${m.color}"></div>${m.label}</div>`;
+    }
+    legend.innerHTML+=`<div class="legend-item"><div class="legend-swatch" style="background:${MIT_ROLE_META.combined.color};height:5px"></div><b style="color:${MIT_ROLE_META.combined.color}">${MIT_ROLE_META.combined.label}</b></div>`;
+    wrap.appendChild(legend);
+  }
+
+  // ── KPI row: per-actor finals (averaged across all sims) ──
+  const tb=data.summary.team_breakdown;
+  const startThird=state.sim.bankroll/3;
+  const kpiWrap=document.createElement("div");
+  kpiWrap.className="chart-container";
+  kpiWrap.style.marginTop="16px";
+  kpiWrap.innerHTML=`<div class="chart-header"><span class="chart-label">AVERAGE FINAL POSITION (across ${data.sims.length} simulations)</span></div>`;
+  const grid=document.createElement("div");
+  grid.style.cssText="display:grid;grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));gap:12px;margin-top:10px;";
+  const fmt=v=>(v>=10000?`$${(v/1000).toFixed(1)}k`:`$${Math.round(v).toLocaleString()}`);
+  for(const role of ["spotter","controller","big_player"]){
+    const m=MIT_ROLE_META[role];
+    const final=tb[role].mean;
+    const pl=final-startThird;
+    const plPct=startThird>0?(pl/startThird*100):0;
+    const plCol=pl>=0?"#66bb6a":"#ef5350";
+    grid.innerHTML+=`
+      <div style="background:var(--bg-elevated);border-radius:8px;padding:14px;border-left:4px solid ${m.color}">
+        <div style="font:400 11px var(--font-mono);color:${m.color};letter-spacing:1px;text-transform:uppercase">${m.label}</div>
+        <div style="font:700 22px var(--font-mono);color:var(--text-primary);margin-top:6px">${fmt(final)}</div>
+        <div style="font:11px var(--font-mono);color:${plCol};margin-top:2px">${pl>=0?"+":""}${fmt(pl)} (${pl>=0?"+":""}${plPct.toFixed(1)}%)</div>
+        <div style="font:300 10px var(--font-sans);color:#666;margin-top:4px">range: ${fmt(tb[role].min)} → ${fmt(tb[role].max)}</div>
+      </div>`;
+  }
+  // Combined card
+  const final=data.summary.mean;
+  const pl=final-state.sim.bankroll;
+  const plCol=pl>=0?"#66bb6a":"#ef5350";
+  grid.innerHTML+=`
+    <div style="background:linear-gradient(135deg, rgba(255,213,79,0.12), rgba(212,168,67,0.04));border-radius:8px;padding:14px;border-left:4px solid ${MIT_ROLE_META.combined.color}">
+      <div style="font:700 11px var(--font-mono);color:${MIT_ROLE_META.combined.color};letter-spacing:1px;text-transform:uppercase">Team Total</div>
+      <div style="font:700 22px var(--font-mono);color:${MIT_ROLE_META.combined.color};margin-top:6px">${fmt(final)}</div>
+      <div style="font:11px var(--font-mono);color:${plCol};margin-top:2px">${pl>=0?"+":""}${fmt(pl)} (${data.summary.roi>=0?"+":""}${data.summary.roi}%)</div>
+      <div style="font:300 10px var(--font-sans);color:#666;margin-top:4px">collated winnings of all 3 roles</div>
+    </div>`;
+  kpiWrap.appendChild(grid);
+
+  // BP play rate stat
+  const bpRate=(data.summary.avg_bp_play_rate||0)*100;
+  const meta=document.createElement("div");
+  meta.style.cssText="font:11px var(--font-mono);color:#888;margin-top:14px;text-align:center";
+  meta.innerHTML=`Big Player engaged on <span style="color:${MIT_ROLE_META.big_player.color};font-weight:700">${bpRate.toFixed(1)}%</span> of rounds (only when true count ≥ +2). Across ${data.sims[0].stats.total_hands} hot-shoe hands his win rate was <span style="color:${MIT_ROLE_META.combined.color};font-weight:700">${(data.sims[0].stats.win_rate*100).toFixed(1)}%</span>.`;
+  kpiWrap.appendChild(meta);
+  container.appendChild(kpiWrap);
+
+  // ── Distribution of team finals ──
+  const distWrap=document.createElement("div");
+  distWrap.className="chart-container";
+  distWrap.style.marginTop="16px";
+  distWrap.innerHTML=`<div class="chart-header"><span class="chart-label">PER-ROLE FINAL DISTRIBUTION (${data.sims.length} sims)</span></div>`;
+  container.appendChild(distWrap);
+
+  const dW=distWrap.clientWidth-100;
+  const dH=240;
+  const dMargin={top:20,right:20,bottom:40,left:60};
+  const dSvg=d3.select(distWrap).append("svg")
+    .attr("width", dW+dMargin.left+dMargin.right)
+    .attr("height", dH+dMargin.top+dMargin.bottom)
+    .append("g").attr("transform",`translate(${dMargin.left},${dMargin.top})`);
+
+  const roles=["spotter","controller","big_player"];
+  const allFinals=[];
+  for(const role of roles){
+    for(const s of data.sims) allFinals.push((s.team_breakdown||{})[role]||0);
+  }
+  const dxMin=Math.min(...allFinals, startThird*0.5);
+  const dxMax=Math.max(...allFinals, startThird*1.5);
+  const dx=d3.scaleLinear().domain([dxMin, dxMax]).range([0, dW]);
+  const dy=d3.scaleBand().domain(roles).range([0, dH]).padding(0.25);
+
+  dSvg.append("g").attr("class","axis").attr("transform",`translate(0,${dH})`)
+    .call(d3.axisBottom(dx).ticks(7).tickFormat(v=>v>=10000?`$${(v/1000).toFixed(0)}k`:`$${Math.round(v).toLocaleString()}`));
+  dSvg.append("g").attr("class","axis")
+    .call(d3.axisLeft(dy).tickFormat(r=>MIT_ROLE_META[r].label));
+
+  // Reference line at starting per-role bankroll
+  dSvg.append("line").attr("x1",dx(startThird)).attr("x2",dx(startThird))
+    .attr("y1",0).attr("y2",dH).attr("stroke","#888").attr("stroke-dasharray","4,4").attr("opacity",0.5);
+
+  // Strip-plot dots: one per simulation per role.
+  for(const role of roles){
+    const col=MIT_ROLE_META[role].color;
+    const yPos=dy(role)+dy.bandwidth()/2;
+    const vals=data.sims.map(s=>(s.team_breakdown||{})[role]||0);
+    dSvg.selectAll(`.dot-${role}`).data(vals).enter().append("circle")
+      .attr("cx",d=>dx(d))
+      .attr("cy",()=>yPos+(Math.random()*dy.bandwidth()*0.5-dy.bandwidth()*0.25))
+      .attr("r",4).attr("fill",col).attr("opacity",0.55);
+    // Mean marker
+    const m=tb[role].mean;
+    dSvg.append("line").attr("x1",dx(m)).attr("x2",dx(m))
+      .attr("y1",yPos-dy.bandwidth()*0.45).attr("y2",yPos+dy.bandwidth()*0.45)
+      .attr("stroke",col).attr("stroke-width",3);
+  }
+}
+
 
 // ══════════════════════════════════════════════════════════════════════════════
 // LIVE REPLAY MODE
@@ -1005,10 +1748,10 @@ function renderLive(){
 
     // Result
     const resEl=document.getElementById("hand-result-display");
-    const resColors={win:col,blackjack:"#ffd54f",loss:"#ef5350",push:"#888"};
-    const resLabels={win:"WIN",blackjack:"BLACKJACK!",loss:"LOSS",push:"PUSH"};
+    const resColors={win:col,blackjack:"#ffd54f",loss:"#ef5350",push:"#888",scout:"#888",active:col};
+    const resLabels={win:"WIN",blackjack:"BLACKJACK!",loss:"LOSS",push:"PUSH",scout:"SCOUTING",active:"PLAYING"};
     resEl.innerHTML=`
-      <div style="font:700 20px var(--font-mono);color:${resColors[hand.result]}">${resLabels[hand.result]}</div>
+      <div style="font:700 20px var(--font-mono);color:${resColors[hand.result]||col}">${resLabels[hand.result]||hand.result.toUpperCase()}</div>
       <div style="font:13px var(--font-mono);color:${hand.net>=0?col:"#ef5350"};margin-top:4px">${hand.net>=0?"+":""}$${hand.net.toLocaleString()}</div>
       <div style="font:11px var(--font-mono);color:#666;margin-top:2px">Bet: $${hand.bet.toLocaleString()}</div>
     `;
@@ -1027,9 +1770,24 @@ function renderLive(){
       <div class="live-stat"><div class="val">${(w/(w+l||1)*100).toFixed(1)}%</div><div class="lbl">WIN RATE</div></div>
     `;
     if(hand.running_count!==undefined){
+      const tcCol=hand.true_count>=2?"#ffd54f":(hand.true_count<=-2?"#ef5350":"var(--text-primary)");
       statsHTML+=`
         <div class="live-stat"><div class="val">${hand.running_count}</div><div class="lbl">RUNNING COUNT</div></div>
-        <div class="live-stat"><div class="val">${hand.true_count}</div><div class="lbl">TRUE COUNT</div></div>
+        <div class="live-stat"><div class="val" style="color:${tcCol}">${hand.true_count}</div><div class="lbl">TRUE COUNT</div></div>
+      `;
+    }
+    // MIT-team specific extras: which actor is playing, per-role bankrolls.
+    if(hand.active_actor){
+      const actorMeta=MIT_ROLE_META[hand.active_actor];
+      const bpFlag=hand.bp_active?`<span style="color:${MIT_ROLE_META.big_player.color}">● BP IN</span>`:`<span style="color:#666">scout</span>`;
+      statsHTML+=`
+        <div class="live-stat" style="border-left:3px solid ${actorMeta.color}">
+          <div class="val" style="font-size:14px;color:${actorMeta.color}">${actorMeta.label}</div>
+          <div class="lbl">ACTING ROLE • ${bpFlag}</div>
+        </div>
+        <div class="live-stat"><div class="val" style="font-size:14px;color:${MIT_ROLE_META.spotter.color}">$${Math.round(hand.spotter_br).toLocaleString()}</div><div class="lbl">SPOTTER BR</div></div>
+        <div class="live-stat"><div class="val" style="font-size:14px;color:${MIT_ROLE_META.controller.color}">$${Math.round(hand.controller_br).toLocaleString()}</div><div class="lbl">CONTROLLER BR</div></div>
+        <div class="live-stat"><div class="val" style="font-size:14px;color:${MIT_ROLE_META.big_player.color}">$${Math.round(hand.big_player_br).toLocaleString()}</div><div class="lbl">BIG PLAYER BR</div></div>
       `;
     }
     document.getElementById("live-stats-grid").innerHTML=statsHTML;
@@ -1159,6 +1917,88 @@ function buildSidebar(){
     row.querySelector("input").oninput=e=>{
       state.sim[s.key]=+e.target.value;
       document.getElementById(`val-${s.key}`).textContent=s.fmt(state.sim[s.key]);
+    };
+  }
+
+  // ── Risk controls: stop-loss & take-profit ──
+  // Both are optional. Each has a quick-pick ladder and a custom-value input
+  // so the user can dial in something specific (e.g. -33% / +75%).
+  const rcc=document.getElementById("risk-controls-container");
+  const riskRows=[
+    {
+      key:"stopLossPct",
+      label:"Stop Loss",
+      hint:"end run if bankroll drops by this %",
+      presets:[
+        {val:null,label:"OFF"},
+        {val:75, label:"-75%"},
+        {val:50, label:"-50%"},
+        {val:25, label:"-25%"},
+        {val:10, label:"-10%"},
+      ],
+      color:"#ef5350",
+    },
+    {
+      key:"takeProfitPct",
+      label:"Take Profit",
+      hint:"end run if bankroll grows by this %",
+      presets:[
+        {val:null,label:"OFF"},
+        {val:25, label:"+25%"},
+        {val:50, label:"+50%"},
+        {val:100, label:"+100%"},
+      ],
+      color:"#66bb6a",
+    },
+  ];
+  for(const r of riskRows){
+    const wrap=document.createElement("div");
+    wrap.className="setting-row";
+    const cur=state.risk[r.key];
+    wrap.innerHTML=`
+      <div class="row-top">
+        <span class="lbl" title="${r.hint}">${r.label}</span>
+        <span class="val" id="val-${r.key}" style="color:${cur==null?"#666":r.color}">${cur==null?"OFF":(r.key==="stopLossPct"?"-":"+")+cur+"%"}</span>
+      </div>
+      <div class="toggle-group" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px" id="presets-${r.key}">
+        ${r.presets.map(p=>`<button class="toggle-opt risk-preset${(cur===p.val||(p.val===null&&cur==null))?" active":""}" data-val="${p.val===null?"":p.val}">${p.label}</button>`).join("")}
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:6px">
+        <input type="number" min="1" max="500" step="1" placeholder="custom %"
+          id="custom-${r.key}" value="${cur!=null && !r.presets.some(p=>p.val===cur) ? cur : ""}"
+          style="flex:1;background:var(--bg-elevated);border:1px solid var(--border);color:var(--text-primary);font:11px var(--font-mono);padding:5px 8px;border-radius:4px">
+        <span style="font:11px var(--font-mono);color:#666">%</span>
+      </div>
+    `;
+    rcc.appendChild(wrap);
+
+    const valEl=wrap.querySelector(`#val-${r.key}`);
+    const presetsEl=wrap.querySelector(`#presets-${r.key}`);
+    const customEl=wrap.querySelector(`#custom-${r.key}`);
+
+    function updateUI(){
+      const cur=state.risk[r.key];
+      valEl.textContent = cur==null ? "OFF" : (r.key==="stopLossPct"?"-":"+")+cur+"%";
+      valEl.style.color = cur==null ? "#666" : r.color;
+      presetsEl.querySelectorAll(".toggle-opt").forEach(b=>{
+        const v=b.dataset.val===""?null:+b.dataset.val;
+        b.classList.toggle("active", v===cur);
+      });
+    }
+    presetsEl.querySelectorAll(".toggle-opt").forEach(btn=>{
+      btn.onclick=()=>{
+        const v=btn.dataset.val===""?null:+btn.dataset.val;
+        state.risk[r.key]=v;
+        if(v==null) customEl.value="";
+        else customEl.value="";
+        updateUI();
+      };
+    });
+    customEl.oninput=e=>{
+      const v=parseFloat(e.target.value);
+      if(isNaN(v) || v<=0){ state.risk[r.key]=null; }
+      else { state.risk[r.key]=v; }
+      updateUI();
     };
   }
 

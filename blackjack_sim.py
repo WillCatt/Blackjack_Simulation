@@ -11,6 +11,12 @@ Strategies implemented:
     - 1-3-2-6 system (positive progression)
     - Oscar's Grind (conservative grind)
     - Hi-Lo card counting (true-count proportional sizing)
+    - Hi-Lo CHEATING: same hand-play as everyone else, but the cheater always
+      knows the EXACT true count of the remaining shoe (perfect recall + no
+      counting errors + no deck-estimation slop), so they bet with full
+      confidence on the optimal ramp.
+    - MIT TEAM: full 3-role professional team (Spotter, Controller, Big
+      Player) with independent bankrolls and a collated team P/L.
 
 Author: William
 """
@@ -293,6 +299,21 @@ def play_hand(shoe: Shoe, dealer_stands_s17: bool = True) -> HandResult:
     )
 
 
+# ─── Helpers for the Cheating Counter ───────────────────────────────────────
+
+def _exact_running_count(shoe: Shoe) -> int:
+    """
+    Compute the Hi-Lo running count of the cards REMAINING in the shoe.
+    The cheating counter has perfect recall and never miscounts, so they
+    effectively know this value at every moment, even at the start of a
+    fresh shoe (where it's always zero).
+    """
+    rc = 0
+    for i in range(shoe.index, len(shoe.cards)):
+        rc -= HILO_COUNT.get(shoe.cards[i], 0)
+    return rc
+
+
 # ─── Betting Strategies ─────────────────────────────────────────────────────
 
 class BettingStrategy:
@@ -432,6 +453,80 @@ class HiLoCount(BettingStrategy):
         self.running_count = 0
 
 
+class HiLoCheat(BettingStrategy):
+    """
+    'Cheating' Hi-Lo counter.
+
+    The ONLY thing the cheater does differently is **know the true count
+    perfectly at every single moment** — they don't have to mentally tally
+    cards as they fly by, they don't make estimation errors on
+    decks-remaining, and they don't need a shoe to "warm up" before
+    trusting the count. They play the same basic strategy as everyone
+    else; the cheat is purely informational.
+
+    Implementation: instead of accumulating a running count from the cards
+    we've seen, we read it straight off the remaining shoe composition
+    each turn. (In our deterministic engine this gives the exact same
+    numeric value as the cards-seen tally, but conceptually it represents
+    perfect recall — and it lets us bet with full confidence.)
+
+    Because the count is rock-solid, the cheater bets on a much steeper
+    ramp than a real-world counter would dare to.
+    """
+    key = "hilo_cheat"
+    name = "Hi-Lo (Cheating)"
+
+    def __init__(self, table_min):
+        super().__init__(table_min)
+        self.running_count = 0       # mirrored for live-replay display
+        self._decks_remaining = 4.0
+        self._shoe_ref = None        # optional handle for perfect-count lookups
+
+    def attach_shoe(self, shoe: Shoe):
+        """Called by the engine each round so we can peek at composition."""
+        self._shoe_ref = shoe
+        self.running_count = _exact_running_count(shoe)
+        self._decks_remaining = max(0.5, shoe.decks_remaining)
+
+    def get_bet(self, decks_remaining: float = 4.0, **kwargs):
+        self._decks_remaining = max(0.5, decks_remaining)
+        tc = self.running_count / self._decks_remaining
+        # Aggressive ramp — the cheater knows EV is positive when TC is positive.
+        if tc <= 0:
+            multiplier = 1
+        elif tc <= 1:
+            multiplier = 4
+        elif tc <= 2:
+            multiplier = 12
+        elif tc <= 3:
+            multiplier = 25
+        elif tc <= 4:
+            multiplier = 40
+        else:
+            multiplier = 60
+        return self.table_min * multiplier
+
+    def update(self, won, net_units, cards_seen=None):
+        # If we have a shoe reference we re-read the count perfectly;
+        # otherwise we fall back to the standard cards-seen tally so the
+        # class still behaves correctly when used outside the engine.
+        if self._shoe_ref is not None:
+            self.running_count = _exact_running_count(self._shoe_ref)
+        elif cards_seen:
+            for card in cards_seen:
+                self.running_count += HILO_COUNT.get(card, 0)
+
+    def on_reshuffle(self):
+        # Fresh shoe → count truly is zero; re-sync from the shoe if attached.
+        if self._shoe_ref is not None:
+            self.running_count = _exact_running_count(self._shoe_ref)
+        else:
+            self.running_count = 0
+
+    def true_count(self) -> float:
+        return self.running_count / max(0.5, self._decks_remaining)
+
+
 STRATEGY_CLASSES = {
     "flat": FlatBet,
     "martingale": Martingale,
@@ -439,6 +534,8 @@ STRATEGY_CLASSES = {
     "oneThreeTwoSix": OneTwoThreeSix,
     "oscar": OscarsGrind,
     "hilo": HiLoCount,
+    "hilo_cheat": HiLoCheat,
+    "mit_team": None,   # MIT team uses a custom multi-actor runner; see run_mit_team_sim
 }
 
 STRATEGY_META = {
@@ -448,6 +545,22 @@ STRATEGY_META = {
     "oneThreeTwoSix":  {"color": "#ffa726", "desc": "Bet 1→3→2→6 units on consecutive wins."},
     "oscar":           {"color": "#ab47bc", "desc": "Raise by 1 unit after a win; reset when cycle profits 1 unit."},
     "hilo":            {"color": "#26c6da", "desc": "Bet proportional to the Hi-Lo true count."},
+    "hilo_cheat":      {"color": "#ffd54f", "desc": "Oracle player — peeks hole card, perfect index plays, ultra-aggressive ramp."},
+    "mit_team":        {"color": "#e040fb", "desc": "MIT-style 3-person team: Spotter counts, Big Player swoops on hot shoes."},
+}
+
+# Friendly display names for each MIT-team role.
+MIT_ROLES = ("spotter", "controller", "big_player")
+MIT_ROLE_LABELS = {
+    "spotter":    "Spotter",
+    "controller": "Controller",
+    "big_player": "Big Player",
+}
+MIT_ROLE_COLORS = {
+    "spotter":    "#4fc3f7",   # cool blue — sits at the table grinding
+    "controller": "#66bb6a",   # green — coordinates and feeds bets
+    "big_player": "#e040fb",   # vivid magenta — swoops in
+    "combined":   "#ffd54f",   # gold — team total
 }
 
 
@@ -466,6 +579,13 @@ class SimConfig:
     dealer_stands_s17: bool = True
     num_sims: int = 50
     strategies: List[str] = field(default_factory=lambda: ["flat", "martingale", "hilo"])
+    # Risk controls. None = disabled.
+    # stop_loss_pct: terminate run early when bankroll falls by this % of start
+    #   (e.g. 25 → stop when bankroll <= start_bankroll * 0.75)
+    # take_profit_pct: terminate run early when bankroll grows by this % above start
+    #   (e.g. 50 → stop when bankroll >= start_bankroll * 1.50)
+    stop_loss_pct: Optional[float] = None
+    take_profit_pct: Optional[float] = None
 
 
 @dataclass
@@ -482,6 +602,271 @@ class HandSnapshot:
     result: str  # "win", "loss", "push", "blackjack"
     running_count: Optional[int] = None
     true_count: Optional[float] = None
+
+
+def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
+    """
+    Run one Monte Carlo simulation of the classic MIT-style 3-person team.
+
+    Roles
+    -----
+    Spotter
+        Sits at the table playing flat table-min bets, counting silently.
+        Their job is to track the count, not to win — they will hover
+        slightly negative on average due to house edge but they generate
+        the signal.
+
+    Controller
+        Verifies the count by playing modest bets (1× → 3× table_min).
+        Acts as the redundancy check on the spotter and is the conduit
+        between the count and the Big Player. Mildly profitable in hot
+        shoes, near-flat in cold ones.
+
+    Big Player
+        Wanders the casino looking like a tourist. Only joins when the
+        team signals a hot shoe (true count ≥ +2) and then bets HUGE
+        — 15× to 60× the table minimum depending on the count. They
+        carry the team's actual edge.
+
+    Per "round" (one entry in the configured `num_hands`), all three actors
+    play sequentially against the same shoe. Their bankrolls update
+    independently and the team total = spotter + controller + big_player.
+    """
+    shoe = Shoe(config.num_decks, config.penetration)
+    bj_multiplier = 1.5 if config.bj_pays == "3:2" else 1.2
+
+    # Split the starting bankroll equally between the three actors.
+    role_br = {role: config.start_bankroll / 3.0 for role in MIT_ROLES}
+    starting_team = sum(role_br.values())
+
+    running_count = 0
+    max_team = starting_team
+    max_drawdown = 0.0
+    ruined = False
+    stopped_loss = False
+    stopped_profit = False
+    hands_played = 0
+
+    # SL / TP thresholds for the team total
+    sl_threshold = None
+    if config.stop_loss_pct is not None and config.stop_loss_pct > 0:
+        sl_threshold = config.start_bankroll * (1.0 - config.stop_loss_pct / 100.0)
+    tp_threshold = None
+    if config.take_profit_pct is not None and config.take_profit_pct > 0:
+        tp_threshold = config.start_bankroll * (1.0 + config.take_profit_pct / 100.0)
+
+    sample_interval = max(1, config.num_hands // 1000)
+    history = [{
+        "hand": 0,
+        "bankroll": round(starting_team, 2),
+        "spotter": round(role_br["spotter"], 2),
+        "controller": round(role_br["controller"], 2),
+        "big_player": round(role_br["big_player"], 2),
+    }]
+    hands: List[Dict] = []
+
+    # Aggregate stats — Big Player hands count toward the team's "wins".
+    bp_wins = bp_losses = bp_pushes = bp_blackjacks = bp_doubles = 0
+    bp_hands_played = 0
+    spot_wins = spot_losses = ctrl_wins = ctrl_losses = 0
+
+    def _safe_reshuffle():
+        nonlocal running_count
+        shoe.reshuffle()
+        running_count = 0
+
+    def _resolve(role: str, bet: float, use_cheat: bool = False) -> Tuple[float, "HandResult"]:
+        """Play one hand for `role` and return (payout, raw_result)."""
+        nonlocal running_count
+        if shoe.needs_reshuffle() or shoe.cards_remaining < 15:
+            _safe_reshuffle()
+        # BP optionally uses the cheat engine — they're the highly trained
+        # one who knows index plays cold; we approximate with the peek engine.
+        play_fn = play_hand_cheat if use_cheat else play_hand
+        r = play_fn(shoe, config.dealer_stands_s17)
+        # Update count from cards we just observed.
+        for c in r.cards_seen:
+            running_count += HILO_COUNT.get(c, 0)
+        if r.is_blackjack and r.net_units > 0:
+            payout = bet * bj_multiplier
+        else:
+            payout = r.net_units * bet
+        role_br[role] = round(role_br[role] + payout, 2)
+        return payout, r
+
+    for h in range(config.num_hands):
+        if shoe.needs_reshuffle():
+            _safe_reshuffle()
+
+        team_br = sum(role_br.values())
+
+        # ── Ruin check (team-level) ──
+        # The team is ruined when the combined bankroll cannot legally cover
+        # at least the spotter sitting in for one more table-min round.
+        if team_br < config.table_min or team_br <= 0:
+            ruined = True
+            break
+
+        # ── Stop-loss / take-profit gates ──
+        if sl_threshold is not None and team_br <= sl_threshold:
+            stopped_loss = True
+            break
+        if tp_threshold is not None and team_br >= tp_threshold:
+            stopped_profit = True
+            break
+
+        hands_played += 1
+        tc_before = running_count / shoe.decks_remaining
+
+        # ── SPOTTER plays flat table_min ──
+        spot_bet = min(config.table_min, max(role_br["spotter"], 0))
+        spot_payout, spot_r = _resolve("spotter", spot_bet) if spot_bet > 0 else (0.0, None)
+        if spot_r is not None:
+            if spot_payout > 0: spot_wins += 1
+            elif spot_payout < 0: spot_losses += 1
+
+        tc_mid = running_count / shoe.decks_remaining
+
+        # ── CONTROLLER plays a moderate bet, scaled by count ──
+        if tc_mid >= 3:
+            ctrl_mult = 4
+        elif tc_mid >= 2:
+            ctrl_mult = 3
+        elif tc_mid >= 1:
+            ctrl_mult = 2
+        else:
+            ctrl_mult = 1
+        ctrl_bet = min(config.table_min * ctrl_mult, config.table_max, max(role_br["controller"], 0))
+        ctrl_payout, ctrl_r = (_resolve("controller", ctrl_bet) if ctrl_bet > 0 else (0.0, None))
+        if ctrl_r is not None:
+            if ctrl_payout > 0: ctrl_wins += 1
+            elif ctrl_payout < 0: ctrl_losses += 1
+
+        tc_after = running_count / shoe.decks_remaining
+
+        # ── BIG PLAYER joins only on a hot shoe (TC ≥ +2) ──
+        bp_payout = 0.0
+        bp_bet = 0.0
+        bp_r = None
+        bp_label = "scout"   # spotter/controller round, BP not playing
+        if tc_after >= 2 and role_br["big_player"] > 0:
+            # Aggressive ramp keyed off true count.
+            if tc_after >= 5:
+                bp_mult = 60
+            elif tc_after >= 4:
+                bp_mult = 40
+            elif tc_after >= 3:
+                bp_mult = 25
+            else:
+                bp_mult = 15
+            bp_bet = min(config.table_min * bp_mult, config.table_max, role_br["big_player"])
+            bp_payout, bp_r = _resolve("big_player", bp_bet, use_cheat=False)
+            bp_hands_played += 1
+            if bp_r.net_units > 0:
+                if bp_r.is_blackjack:
+                    bp_blackjacks += 1
+                    bp_label = "blackjack"
+                else:
+                    bp_wins += 1
+                    bp_label = "win"
+            elif bp_r.net_units < 0:
+                bp_losses += 1
+                bp_label = "loss"
+            else:
+                bp_pushes += 1
+                bp_label = "push"
+            if bp_r.doubled:
+                bp_doubles += 1
+
+        team_br = sum(role_br.values())
+        max_team = max(max_team, team_br)
+        if max_team > 0:
+            floor_br = max(team_br, 0)
+            dd = (max_team - floor_br) / max_team
+            dd = max(0.0, min(1.0, dd))
+            max_drawdown = max(max_drawdown, dd)
+
+        if h % sample_interval == 0 or h == config.num_hands - 1:
+            history.append({
+                "hand": h + 1,
+                "bankroll": round(team_br, 2),
+                "spotter": round(role_br["spotter"], 2),
+                "controller": round(role_br["controller"], 2),
+                "big_player": round(role_br["big_player"], 2),
+            })
+
+        if record_hands:
+            # Pick the most "interesting" hand to display: BP if active,
+            # otherwise controller, otherwise spotter.
+            display_r = bp_r or ctrl_r or spot_r
+            display_bet = bp_bet if bp_r else (ctrl_bet if ctrl_r else spot_bet)
+            display_actor = "big_player" if bp_r else ("controller" if ctrl_r else "spotter")
+            snap = {
+                "hand_num": h + 1,
+                "bankroll": round(team_br, 2),
+                "bet": round(display_bet, 2),
+                "net": round(spot_payout + ctrl_payout + bp_payout, 2),
+                "result": bp_label if bp_r else ("active" if ctrl_r or spot_r else "scout"),
+                "player_cards": display_r.player_cards if display_r else [],
+                "dealer_cards": display_r.dealer_cards if display_r else [],
+                "player_total": display_r.player_total if display_r else 0,
+                "dealer_total": display_r.dealer_total if display_r else 0,
+                "running_count": running_count,
+                "true_count": round(running_count / shoe.decks_remaining, 2),
+                "active_actor": display_actor,
+                "bp_active": bp_r is not None,
+                # Per-role detail
+                "spotter_br": round(role_br["spotter"], 2),
+                "controller_br": round(role_br["controller"], 2),
+                "big_player_br": round(role_br["big_player"], 2),
+                "spotter_bet": round(spot_bet, 2),
+                "controller_bet": round(ctrl_bet, 2),
+                "big_player_bet": round(bp_bet, 2),
+                "spotter_pl": round(spot_payout, 2),
+                "controller_pl": round(ctrl_payout, 2),
+                "big_player_pl": round(bp_payout, 2),
+            }
+            hands.append(snap)
+
+    bp_total = bp_wins + bp_losses + bp_pushes + bp_blackjacks
+    final_team = sum(role_br.values())
+    if history[-1]["hand"] != hands_played:
+        history.append({
+            "hand": hands_played,
+            "bankroll": round(final_team, 2),
+            "spotter": round(role_br["spotter"], 2),
+            "controller": round(role_br["controller"], 2),
+            "big_player": round(role_br["big_player"], 2),
+        })
+    return {
+        "history": history,
+        "hands": hands if record_hands else [],
+        "final_bankroll": round(final_team, 2),
+        "team_breakdown": {
+            "spotter":    round(role_br["spotter"], 2),
+            "controller": round(role_br["controller"], 2),
+            "big_player": round(role_br["big_player"], 2),
+        },
+        "max_drawdown": round(max_drawdown, 4),
+        "ruined": ruined,
+        "stopped_loss": stopped_loss,
+        "stopped_profit": stopped_profit,
+        "hands_played": hands_played,
+        "stats": {
+            # "Headline" stats use Big Player hands — they're the team's edge.
+            "total_hands": bp_total,
+            "wins": bp_wins,
+            "losses": bp_losses,
+            "pushes": bp_pushes,
+            "blackjacks": bp_blackjacks,
+            "doubles": bp_doubles,
+            "win_rate": round((bp_wins + bp_blackjacks) / max(bp_total, 1), 4),
+            "bp_hands_played": bp_hands_played,
+            "bp_play_rate": round(bp_hands_played / max(config.num_hands, 1), 4),
+            "spotter_record": {"wins": spot_wins, "losses": spot_losses},
+            "controller_record": {"wins": ctrl_wins, "losses": ctrl_losses},
+        },
+    }
 
 
 def run_single_sim(
@@ -504,19 +889,37 @@ def run_single_sim(
     dict with keys: history (sampled bankroll), hands (if recorded),
     final_bankroll, max_drawdown, ruined, stats.
     """
+    # MIT team is a multi-actor strategy and has its own runner.
+    if strategy_key == "mit_team":
+        return run_mit_team_sim(config, record_hands=record_hands)
+
     shoe = Shoe(config.num_decks, config.penetration)
     strategy = STRATEGY_CLASSES[strategy_key](config.table_min)
     bankroll = config.start_bankroll
     max_bankroll = bankroll
     max_drawdown = 0.0
     ruined = False
+    stopped_loss = False
+    stopped_profit = False
+
+    # Pre-compute SL / TP thresholds (None when disabled)
+    sl_threshold = None
+    if config.stop_loss_pct is not None and config.stop_loss_pct > 0:
+        sl_threshold = config.start_bankroll * (1.0 - config.stop_loss_pct / 100.0)
+    tp_threshold = None
+    if config.take_profit_pct is not None and config.take_profit_pct > 0:
+        tp_threshold = config.start_bankroll * (1.0 + config.take_profit_pct / 100.0)
 
     bj_multiplier = 1.5 if config.bj_pays == "3:2" else 1.2
+    # All strategies use the standard hand-resolution engine — the
+    # "cheating" Hi-Lo only differs in how it knows the count.
+    play_fn = play_hand
 
     # Sampling for bankroll chart (cap at ~1000 points)
     sample_interval = max(1, config.num_hands // 1000)
     history = [{"hand": 0, "bankroll": bankroll}]
     hands = []
+    hands_played = 0   # track actual hands dealt (may be < num_hands if SL/TP/ruin)
 
     wins, losses, pushes, blackjacks, doubles = 0, 0, 0, 0, 0
 
@@ -525,13 +928,38 @@ def run_single_sim(
             shoe.reshuffle()
             strategy.on_reshuffle()
 
-        if bankroll <= 0:
+        # Cheating Hi-Lo reads the count directly off the shoe before sizing.
+        if isinstance(strategy, HiLoCheat):
+            strategy.attach_shoe(shoe)
+
+        # Determine the bet the strategy *wants* to place this round.
+        raw_bet = strategy.get_bet(decks_remaining=shoe.decks_remaining)
+        # Floor at the table min (you can't bet less than the minimum).
+        next_required_bet = max(raw_bet, config.table_min)
+
+        # ── Ruin check ──
+        # A run is ruined the moment the player can no longer legally place
+        # the bet their strategy demands:
+        #   • bankroll has fallen below the table minimum, OR
+        #   • the strategy needs more than the table maximum, OR
+        #   • the strategy needs more than the player has on hand.
+        if (
+            bankroll < config.table_min
+            or next_required_bet > config.table_max
+            or bankroll < next_required_bet
+        ):
             ruined = True
             break
 
-        # Determine bet
-        raw_bet = strategy.get_bet(decks_remaining=shoe.decks_remaining)
-        bet = min(max(raw_bet, config.table_min), config.table_max, bankroll)
+        # ── Stop-loss / take-profit gates ──
+        if sl_threshold is not None and bankroll <= sl_threshold:
+            stopped_loss = True
+            break
+        if tp_threshold is not None and bankroll >= tp_threshold:
+            stopped_profit = True
+            break
+
+        bet = next_required_bet  # all guards passed — required bet is legal
 
         # Safety check — ensure enough cards
         if shoe.cards_remaining < 15:
@@ -539,7 +967,8 @@ def run_single_sim(
             strategy.on_reshuffle()
 
         # Play the hand
-        result = play_hand(shoe, config.dealer_stands_s17)
+        result = play_fn(shoe, config.dealer_stands_s17)
+        hands_played += 1
 
         # Calculate payout
         if result.is_blackjack and result.net_units > 0:
@@ -549,7 +978,11 @@ def run_single_sim(
 
         bankroll = round(bankroll + payout, 2)
         max_bankroll = max(max_bankroll, bankroll)
-        dd = (max_bankroll - bankroll) / max_bankroll if max_bankroll > 0 else 0
+        # Drawdown is the % decline of bankroll from its running peak,
+        # clamped to [0, 1] in case of negative bankroll due to rounding.
+        floor_br = max(bankroll, 0)
+        dd = (max_bankroll - floor_br) / max_bankroll if max_bankroll > 0 else 0
+        dd = max(0.0, min(1.0, dd))
         max_drawdown = max(max_drawdown, dd)
 
         # Classify result
@@ -591,18 +1024,25 @@ def run_single_sim(
                 "dealer_total": result.dealer_total,
                 "result": result_label,
             }
-            if strategy_key == "hilo":
+            if strategy_key in ("hilo", "hilo_cheat"):
                 snap["running_count"] = strategy.running_count
                 snap["true_count"] = round(strategy.running_count / shoe.decks_remaining, 2)
             hands.append(snap)
 
     total_hands = wins + losses + pushes + blackjacks
+    # Always record the final bankroll as the last history point so curves
+    # have a reliable termination value even if the loop exited mid-interval.
+    if history[-1]["hand"] != hands_played:
+        history.append({"hand": hands_played, "bankroll": round(bankroll, 2)})
     return {
         "history": history,
         "hands": hands if record_hands else [],
         "final_bankroll": round(bankroll, 2),
         "max_drawdown": round(max_drawdown, 4),
         "ruined": ruined,
+        "stopped_loss": stopped_loss,
+        "stopped_profit": stopped_profit,
+        "hands_played": hands_played,
         "stats": {
             "total_hands": total_hands,
             "wins": wins,
@@ -662,28 +1102,172 @@ def run_simulation(config: SimConfig) -> Dict:
         variance = sum((f - mean_final) ** 2 for f in finals) / n
         std_final = variance ** 0.5
         ruin_rate = sum(1 for s in sims if s["ruined"]) / n
+        stopped_loss_rate = sum(1 for s in sims if s.get("stopped_loss")) / n
+        stopped_profit_rate = sum(1 for s in sims if s.get("stopped_profit")) / n
         avg_max_dd = sum(s["max_drawdown"] for s in sims) / n
+        # Profit chance: % of sims where the player walked away with MORE than
+        # the starting bankroll. This is the actual "did I win money?" metric.
+        profit_chance = sum(1 for f in finals if f > config.start_bankroll) / n
+        # EV per hand: average profit / hands actually played, across sims.
+        total_profit = sum(f - config.start_bankroll for f in finals)
+        total_hands_played = sum(max(s.get("hands_played", config.num_hands), 1) for s in sims)
+        ev_per_hand = total_profit / max(total_hands_played, 1)
+
+        def _pct(p: float) -> float:
+            idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+            return finals_sorted[idx]
+
+        # Resolve display name — mit_team has no class.
+        display_name = (
+            STRATEGY_CLASSES[skey].name if STRATEGY_CLASSES[skey] is not None
+            else {"mit_team": "MIT Team"}.get(skey, skey)
+        )
+
+        # ── Build survival & profit-probability curves ──
+        # Sample every num_hands/60 hands so the curves stay light to render.
+        NPOINTS = 60
+        grid = [round(config.num_hands * i / NPOINTS) for i in range(NPOINTS + 1)]
+
+        def _bankroll_at(hist: List[Dict], target: int) -> float:
+            """Largest history-recorded bankroll at a hand <= target."""
+            br = hist[0]["bankroll"]
+            for pt in hist:
+                if pt["hand"] <= target:
+                    br = pt["bankroll"]
+                else:
+                    break
+            return br
+
+        def _reached(s: Dict, target: int) -> bool:
+            """Did this sim still have a live bankroll AT this hand?"""
+            last_hand = s["history"][-1]["hand"]
+            if s.get("ruined"):
+                return last_hand > target  # ruined sim is alive only up to the hand it died
+            return last_hand >= target  # SL/TP/end-of-run sim's last value carries forward
+
+        curves = []
+        for hand_target in grid:
+            alive = 0
+            in_profit = 0
+            brs = []
+            for s in sims:
+                br = _bankroll_at(s["history"], hand_target)
+                if _reached(s, hand_target):
+                    alive += 1
+                    brs.append(br)
+                    if br > config.start_bankroll:
+                        in_profit += 1
+                else:
+                    # Run already terminated — carry the last bankroll forward
+                    brs.append(s["final_bankroll"])
+                    if s["final_bankroll"] > config.start_bankroll:
+                        in_profit += 1
+            brs.sort()
+            n_brs = len(brs)
+            def _pct_of(arr, p):
+                if not arr: return 0
+                idx = max(0, min(len(arr)-1, int(round(p * (len(arr)-1)))))
+                return arr[idx]
+            curves.append({
+                "hand": hand_target,
+                "survival_pct": round(alive / n * 100, 2),
+                "profit_chance_pct": round(in_profit / n * 100, 2),
+                "median": round(_pct_of(brs, 0.50), 2),
+                "p5":  round(_pct_of(brs, 0.05), 2),
+                "p25": round(_pct_of(brs, 0.25), 2),
+                "p75": round(_pct_of(brs, 0.75), 2),
+                "p95": round(_pct_of(brs, 0.95), 2),
+            })
+
+        # ── Color status & interpretation tag ──
+        # Color: green only if ALL of (profit_chance > 50%, median > start, ruin < 10%);
+        # red if ANY of (ruin >= 25%, median <= start, drawdown >= 75%); else amber.
+        median_above_start = median_final > config.start_bankroll
+        if profit_chance > 0.50 and median_above_start and ruin_rate < 0.10:
+            color_status = "green"
+        elif ruin_rate >= 0.25 or not median_above_start or avg_max_dd >= 0.75:
+            color_status = "red"
+        else:
+            color_status = "amber"
+
+        # Interpretation tags — short hints flagging "why" a strategy looks
+        # the way it does in the table. Multiple tags can apply.
+        tags = []
+        warning = None
+        if ruin_rate >= 0.50:
+            tags.append("Low survival")
+        if mean_final > config.start_bankroll and median_final <= config.start_bankroll:
+            tags.append("Outlier-driven")
+            warning = "Mean inflated by rare outliers"
+        if std_final > config.start_bankroll * 1.0:
+            tags.append("High volatility")
+        if median_final < config.start_bankroll * 0.95 and ruin_rate < 0.20:
+            tags.append("Stable loser")
+        if (
+            median_final > config.start_bankroll * 1.05
+            and avg_max_dd < 0.30
+            and ruin_rate < 0.05
+        ):
+            tags.append("Stable winner")
+        # The cheat is, by construction, an unrealistic upper bound.
+        if skey == "hilo_cheat":
+            tags.append("Cheating / invalid")
+
+        summary = {
+            "mean": round(mean_final, 2),
+            "median": round(median_final, 2),
+            "std": round(std_final, 2),
+            "min": round(min(finals), 2),
+            "max": round(max(finals), 2),
+            "p5":  round(_pct(0.05), 2),
+            "p10": round(_pct(0.10), 2),
+            "p25": round(_pct(0.25), 2),
+            "p75": round(_pct(0.75), 2),
+            "p90": round(_pct(0.90), 2),
+            "p95": round(_pct(0.95), 2),
+            "ruin_rate": round(ruin_rate, 4),
+            "stopped_loss_rate": round(stopped_loss_rate, 4),
+            "stopped_profit_rate": round(stopped_profit_rate, 4),
+            "avg_max_drawdown": round(avg_max_dd, 4),
+            "roi": round((mean_final - config.start_bankroll) / config.start_bankroll * 100, 2),
+            "profit_chance_pct": round(profit_chance * 100, 2),
+            "ev_per_hand": round(ev_per_hand, 4),
+            "median_profit": round(median_final - config.start_bankroll, 2),
+            "color_status": color_status,
+            "tags": tags,
+            "warning": warning,
+            "curves": curves,
+            "finals": [round(f, 2) for f in finals],   # for distribution chart
+        }
+
+        # MIT team — also surface average per-role final bankrolls.
+        if skey == "mit_team":
+            role_finals = {role: [] for role in MIT_ROLES}
+            for s in sims:
+                tb = s.get("team_breakdown", {})
+                for role in MIT_ROLES:
+                    role_finals[role].append(tb.get(role, 0.0))
+            summary["team_breakdown"] = {
+                role: {
+                    "mean": round(sum(vals) / max(len(vals), 1), 2),
+                    "min": round(min(vals), 2) if vals else 0,
+                    "max": round(max(vals), 2) if vals else 0,
+                }
+                for role, vals in role_finals.items()
+            }
+            # Average BP play rate (proportion of rounds the Big Player engaged)
+            bp_rates = [s["stats"].get("bp_play_rate", 0) for s in sims]
+            summary["avg_bp_play_rate"] = round(sum(bp_rates) / max(len(bp_rates), 1), 4)
 
         output["strategies"][skey] = {
             "meta": {
-                "name": STRATEGY_CLASSES[skey].name,
+                "name": display_name,
                 "color": STRATEGY_META[skey]["color"],
                 "desc": STRATEGY_META[skey]["desc"],
             },
             "sims": sims,
             "live_hands": live_hands,
-            "summary": {
-                "mean": round(mean_final, 2),
-                "median": round(median_final, 2),
-                "std": round(std_final, 2),
-                "min": round(min(finals), 2),
-                "max": round(max(finals), 2),
-                "p10": round(finals_sorted[int(n * 0.1)], 2),
-                "p90": round(finals_sorted[int(n * 0.9)], 2),
-                "ruin_rate": round(ruin_rate, 4),
-                "avg_max_drawdown": round(avg_max_dd, 4),
-                "roi": round((mean_final - config.start_bankroll) / config.start_bankroll * 100, 2),
-            },
+            "summary": summary,
         }
 
     return output
@@ -705,6 +1289,10 @@ def main():
                         choices=list(STRATEGY_CLASSES.keys()))
     parser.add_argument("--output", type=str, default="simulation_results.json")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--stop-loss", type=float, default=None,
+                        help="Terminate run when bankroll drops by this %% of start (e.g. 25)")
+    parser.add_argument("--take-profit", type=float, default=None,
+                        help="Terminate run when bankroll grows by this %% above start (e.g. 50)")
 
     args = parser.parse_args()
 
@@ -721,6 +1309,8 @@ def main():
         bj_pays=args.bj_pays,
         num_sims=args.sims,
         strategies=args.strategies,
+        stop_loss_pct=args.stop_loss,
+        take_profit_pct=args.take_profit,
     )
 
     print(f"Running {config.num_sims} simulations × {len(config.strategies)} strategies "
@@ -732,13 +1322,30 @@ def main():
     out_path.write_text(json.dumps(results, indent=2))
     print(f"Results written to {out_path}")
 
-    # Print summary table
-    print(f"\n{'Strategy':<20} {'Mean':>10} {'ROI':>8} {'Ruin%':>8} {'MaxDD':>8}")
-    print("─" * 58)
-    for skey, data in results["strategies"].items():
+    # Print summary table — survival-first ranking
+    print(f"\n{'Strategy':<22} {'Profit%':>9} {'Ruin%':>8} {'Median':>11} "
+          f"{'EV/Hand':>10} {'MaxDD':>8} {'Tag':<22}")
+    print("─" * 96)
+    # Sort by profit_chance_pct descending so the best survival/profit combo is on top.
+    rows = sorted(
+        results["strategies"].items(),
+        key=lambda kv: kv[1]["summary"].get("profit_chance_pct", 0),
+        reverse=True,
+    )
+    for skey, data in rows:
         s = data["summary"]
-        print(f"{data['meta']['name']:<20} ${s['mean']:>9,.0f} {s['roi']:>7.1f}% "
-              f"{s['ruin_rate']*100:>7.1f}% {s['avg_max_drawdown']*100:>7.1f}%")
+        tag_str = ", ".join(s.get("tags", [])) or "—"
+        print(f"{data['meta']['name']:<22} {s['profit_chance_pct']:>8.1f}% "
+              f"{s['ruin_rate']*100:>7.1f}% ${s['median']:>10,.0f} "
+              f"${s['ev_per_hand']:>9.3f} {s['avg_max_drawdown']*100:>7.1f}% {tag_str:<22}")
+        if s.get("warning"):
+            print(f"   ⚠ {s['warning']}")
+        if skey == "mit_team" and "team_breakdown" in s:
+            tb = s["team_breakdown"]
+            print(f"   ↳ Spotter:    ${tb['spotter']['mean']:>10,.0f}   "
+                  f"Controller: ${tb['controller']['mean']:>10,.0f}   "
+                  f"Big Player: ${tb['big_player']['mean']:>10,.0f}   "
+                  f"BP play rate: {s['avg_bp_play_rate']*100:.1f}%")
 
 
 if __name__ == "__main__":
