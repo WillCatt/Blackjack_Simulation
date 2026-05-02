@@ -629,15 +629,19 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
         carry the team's actual edge.
 
     Per "round" (one entry in the configured `num_hands`), all three actors
-    play sequentially against the same shoe. Their bankrolls update
-    independently and the team total = spotter + controller + big_player.
+    play sequentially against the same shoe. They draw from a single SHARED
+    team bankroll — every actor can bet up to whatever is left in the pool.
+    `role_pl` tracks each role's CUMULATIVE contribution to the pool so we
+    can attribute team profit back to the actor that produced it.
     """
     shoe = Shoe(config.num_decks, config.penetration)
     bj_multiplier = 1.5 if config.bj_pays == "3:2" else 1.2
 
-    # Split the starting bankroll equally between the three actors.
-    role_br = {role: config.start_bankroll / 3.0 for role in MIT_ROLES}
-    starting_team = sum(role_br.values())
+    # Single shared pool — every actor bets from this.
+    bankroll = float(config.start_bankroll)
+    starting_team = bankroll
+    # Per-role cumulative P/L (their contribution to the pool's growth).
+    role_pl = {role: 0.0 for role in MIT_ROLES}
 
     running_count = 0
     max_team = starting_team
@@ -659,9 +663,9 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
     history = [{
         "hand": 0,
         "bankroll": round(starting_team, 2),
-        "spotter": round(role_br["spotter"], 2),
-        "controller": round(role_br["controller"], 2),
-        "big_player": round(role_br["big_player"], 2),
+        "spotter_pl": 0.0,
+        "controller_pl": 0.0,
+        "big_player_pl": 0.0,
     }]
     hands: List[Dict] = []
 
@@ -676,8 +680,12 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
         running_count = 0
 
     def _resolve(role: str, bet: float, use_cheat: bool = False) -> Tuple[float, "HandResult"]:
-        """Play one hand for `role` and return (payout, raw_result)."""
-        nonlocal running_count
+        """Play one hand for `role` against the shared pool.
+
+        Returns (payout, raw_result). Updates both the shared ``bankroll``
+        and the role's cumulative ``role_pl`` contribution.
+        """
+        nonlocal running_count, bankroll
         if shoe.needs_reshuffle() or shoe.cards_remaining < 15:
             _safe_reshuffle()
         # BP optionally uses the cheat engine — they're the highly trained
@@ -691,27 +699,26 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
             payout = bet * bj_multiplier
         else:
             payout = r.net_units * bet
-        role_br[role] = round(role_br[role] + payout, 2)
+        bankroll = round(bankroll + payout, 2)
+        role_pl[role] = round(role_pl[role] + payout, 2)
         return payout, r
 
     for h in range(config.num_hands):
         if shoe.needs_reshuffle():
             _safe_reshuffle()
 
-        team_br = sum(role_br.values())
-
         # ── Ruin check (team-level) ──
-        # The team is ruined when the combined bankroll cannot legally cover
-        # at least the spotter sitting in for one more table-min round.
-        if team_br < config.table_min or team_br <= 0:
+        # The team is ruined when the shared pool cannot legally cover
+        # the spotter sitting in for one more table-min round.
+        if bankroll < config.table_min or bankroll <= 0:
             ruined = True
             break
 
         # ── Stop-loss / take-profit gates ──
-        if sl_threshold is not None and team_br <= sl_threshold:
+        if sl_threshold is not None and bankroll <= sl_threshold:
             stopped_loss = True
             break
-        if tp_threshold is not None and team_br >= tp_threshold:
+        if tp_threshold is not None and bankroll >= tp_threshold:
             stopped_profit = True
             break
 
@@ -719,7 +726,7 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
         tc_before = running_count / shoe.decks_remaining
 
         # ── SPOTTER plays flat table_min ──
-        spot_bet = min(config.table_min, max(role_br["spotter"], 0))
+        spot_bet = min(config.table_min, max(bankroll, 0))
         spot_payout, spot_r = _resolve("spotter", spot_bet) if spot_bet > 0 else (0.0, None)
         if spot_r is not None:
             if spot_payout > 0: spot_wins += 1
@@ -736,7 +743,7 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
             ctrl_mult = 2
         else:
             ctrl_mult = 1
-        ctrl_bet = min(config.table_min * ctrl_mult, config.table_max, max(role_br["controller"], 0))
+        ctrl_bet = min(config.table_min * ctrl_mult, config.table_max, max(bankroll, 0))
         ctrl_payout, ctrl_r = (_resolve("controller", ctrl_bet) if ctrl_bet > 0 else (0.0, None))
         if ctrl_r is not None:
             if ctrl_payout > 0: ctrl_wins += 1
@@ -749,7 +756,7 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
         bp_bet = 0.0
         bp_r = None
         bp_label = "scout"   # spotter/controller round, BP not playing
-        if tc_after >= 2 and role_br["big_player"] > 0:
+        if tc_after >= 2 and bankroll > 0:
             # Aggressive ramp keyed off true count.
             if tc_after >= 5:
                 bp_mult = 60
@@ -759,7 +766,8 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
                 bp_mult = 25
             else:
                 bp_mult = 15
-            bp_bet = min(config.table_min * bp_mult, config.table_max, role_br["big_player"])
+            # Big Player draws from the FULL team bankroll, not a slice.
+            bp_bet = min(config.table_min * bp_mult, config.table_max, bankroll)
             bp_payout, bp_r = _resolve("big_player", bp_bet, use_cheat=False)
             bp_hands_played += 1
             if bp_r.net_units > 0:
@@ -778,10 +786,9 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
             if bp_r.doubled:
                 bp_doubles += 1
 
-        team_br = sum(role_br.values())
-        max_team = max(max_team, team_br)
+        max_team = max(max_team, bankroll)
         if max_team > 0:
-            floor_br = max(team_br, 0)
+            floor_br = max(bankroll, 0)
             dd = (max_team - floor_br) / max_team
             dd = max(0.0, min(1.0, dd))
             max_drawdown = max(max_drawdown, dd)
@@ -789,10 +796,10 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
         if h % sample_interval == 0 or h == config.num_hands - 1:
             history.append({
                 "hand": h + 1,
-                "bankroll": round(team_br, 2),
-                "spotter": round(role_br["spotter"], 2),
-                "controller": round(role_br["controller"], 2),
-                "big_player": round(role_br["big_player"], 2),
+                "bankroll": round(bankroll, 2),
+                "spotter_pl": round(role_pl["spotter"], 2),
+                "controller_pl": round(role_pl["controller"], 2),
+                "big_player_pl": round(role_pl["big_player"], 2),
             })
 
         if record_hands:
@@ -803,7 +810,7 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
             display_actor = "big_player" if bp_r else ("controller" if ctrl_r else "spotter")
             snap = {
                 "hand_num": h + 1,
-                "bankroll": round(team_br, 2),
+                "bankroll": round(bankroll, 2),
                 "bet": round(display_bet, 2),
                 "net": round(spot_payout + ctrl_payout + bp_payout, 2),
                 "result": bp_label if bp_r else ("active" if ctrl_r or spot_r else "scout"),
@@ -815,10 +822,11 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
                 "true_count": round(running_count / shoe.decks_remaining, 2),
                 "active_actor": display_actor,
                 "bp_active": bp_r is not None,
-                # Per-role detail
-                "spotter_br": round(role_br["spotter"], 2),
-                "controller_br": round(role_br["controller"], 2),
-                "big_player_br": round(role_br["big_player"], 2),
+                # Per-role detail — cumulative P/L contributions, plus
+                # this-hand's bet & payout for each actor.
+                "spotter_pl_cum": round(role_pl["spotter"], 2),
+                "controller_pl_cum": round(role_pl["controller"], 2),
+                "big_player_pl_cum": round(role_pl["big_player"], 2),
                 "spotter_bet": round(spot_bet, 2),
                 "controller_bet": round(ctrl_bet, 2),
                 "big_player_bet": round(bp_bet, 2),
@@ -829,23 +837,25 @@ def run_mit_team_sim(config: "SimConfig", record_hands: bool = False) -> Dict:
             hands.append(snap)
 
     bp_total = bp_wins + bp_losses + bp_pushes + bp_blackjacks
-    final_team = sum(role_br.values())
+    final_team = bankroll
     if history[-1]["hand"] != hands_played:
         history.append({
             "hand": hands_played,
             "bankroll": round(final_team, 2),
-            "spotter": round(role_br["spotter"], 2),
-            "controller": round(role_br["controller"], 2),
-            "big_player": round(role_br["big_player"], 2),
+            "spotter_pl": round(role_pl["spotter"], 2),
+            "controller_pl": round(role_pl["controller"], 2),
+            "big_player_pl": round(role_pl["big_player"], 2),
         })
     return {
         "history": history,
         "hands": hands if record_hands else [],
         "final_bankroll": round(final_team, 2),
+        # team_breakdown now contains per-role CUMULATIVE P/L contributions,
+        # not bankroll slices. spotter + controller + big_player == final - start.
         "team_breakdown": {
-            "spotter":    round(role_br["spotter"], 2),
-            "controller": round(role_br["controller"], 2),
-            "big_player": round(role_br["big_player"], 2),
+            "spotter":    round(role_pl["spotter"], 2),
+            "controller": round(role_pl["controller"], 2),
+            "big_player": round(role_pl["big_player"], 2),
         },
         "max_drawdown": round(max_drawdown, 4),
         "ruined": ruined,
@@ -1378,9 +1388,12 @@ def main():
             print(f"   ⚠ {s['warning']}")
         if skey == "mit_team" and "team_breakdown" in s:
             tb = s["team_breakdown"]
-            print(f"   ↳ Spotter:    ${tb['spotter']['mean']:>10,.0f}   "
-                  f"Controller: ${tb['controller']['mean']:>10,.0f}   "
-                  f"Big Player: ${tb['big_player']['mean']:>10,.0f}   "
+            # team_breakdown values are now per-role cumulative P/L contributions
+            # (signed). Sum approximately equals avg_final - start_bankroll.
+            def _fmt_pl(v): return f"{'+' if v >= 0 else '-'}${abs(v):>8,.0f}"
+            print(f"   ↳ Spotter P/L:   {_fmt_pl(tb['spotter']['mean'])}   "
+                  f"Controller P/L: {_fmt_pl(tb['controller']['mean'])}   "
+                  f"Big Player P/L: {_fmt_pl(tb['big_player']['mean'])}   "
                   f"BP play rate: {s['avg_bp_play_rate']*100:.1f}%")
 
 
