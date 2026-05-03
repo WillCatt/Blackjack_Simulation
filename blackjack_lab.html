@@ -423,45 +423,54 @@
 
 <script>
 // ══════════════════════════════════════════════════════════════════════════════
-// TABLE OF CONTENTS  (line numbers approximate — re-grep the section banners)
+// TABLE OF CONTENTS  (sections appear in this order — grep for the banner text)
 // ══════════════════════════════════════════════════════════════════════════════
-//   CONFIG & STATE ........................... ~L425
-//   CARD / SHOE / RULES ENGINE ............... ~L470
-//     · cheating Hi-Lo helper ................ ~L555
-//     · betting-strategy state machines ...... ~L570
-//     · full single-strategy simulation ...... ~L615
-//     · MIT-team simulation (shared pool) .... ~L685
-//   AGGREGATION & RUN PIPELINE ............... ~L1020
-//     · renderBankroll ....................... ~L1055
-//     · OUTCOME_META + renderDistribution .... ~L1150
-//     · renderSurvival ....................... ~L1445
-//     · renderStats .......................... ~L1535
-//   MIT TEAM TAB ............................. ~L1660
-//     · renderTeam ........................... ~L1665
-//   SWEEP TAB ................................ ~L1875
-//     · SWEEP_PARAMS / SWEEP_PRESETS ......... ~L1885
-//     · renderSweep / runSweep ............... ~L1955
-//     · renderSweepCharts .................... ~L2185
-//   LIVE TAB / HAND VIEWER ................... ~L2350
-//   BOOTSTRAP / WIRING ....................... ~L2580
+//   SHARED UTILITIES                          (fmt$, wilson95)
+//   CONFIG & STATE                            (STRATEGIES, MIT_ROLE_META, state)
+//   CARD / SHOE / RULES ENGINE                (createShoe, basicStrategy, playHand)
+//     · cheating Hi-Lo helper                 (exactRunningCount)
+//     · betting-strategy state machines       (initBet, getBet, updateBet)
+//     · full single-strategy simulation       (simulate)
+//     · MIT-team simulation (shared pool)     (simulateMitTeam)
+//   AGGREGATION & RUN PIPELINE                (runSimulation)
+//   PIN / UNPIN — A/B overlay                 (togglePin, pinLabel)
+//   RENDERING — TABS
+//     · renderBankroll                        (median+band line, n-alive tooltip)
+//     · OUTCOME_META + renderDistribution     (3 panels: outcomes, cum-ruin, timeline)
+//     · renderSurvival                        (% alive + % in profit curves)
+//     · renderStats                           (sortable summary table + CIs)
+//   MIT TEAM TAB                              (renderTeam, BP-driven line + per-role hover)
+//   SWEEP TAB                                 (SWEEP_PARAMS, SWEEP_PRESETS)
+//     · renderSweep / runSweep                (controls, presets, async chunked run)
+//     · renderSweepCharts                     (per-strategy curves across param)
+//   LIVE TAB / HAND VIEWER                    (renderLive, card replay)
+//   BOOTSTRAP / WIRING                        (sidebar build, event listeners)
 // ══════════════════════════════════════════════════════════════════════════════
 // SHARED UTILITIES
 // ══════════════════════════════════════════════════════════════════════════════
 
 // Single money formatter used everywhere.
 //   fmt$(1234)                       → "$1,234"
-//   fmt$(12500, {compact:true})      → "$13k"
+//   fmt$(12500)                      → "$12,500"          (full digits up to $100k)
+//   fmt$(125000)                     → "$125k"            (compact above)
 //   fmt$(-250, {signed:true})        → "-$250"
 //   fmt$(2500, {signed:true})        → "+$2,500"
 //   fmt$(0, {signed:true})           → "+$0"
+//   fmt$(8500, {compact:'force'})    → "$9k"              (force compact below $100k)
+//
+// The threshold sits at $100k because the typical lab range is $5k–$50k where
+// values like $9,800 vs $11,200 should NOT flip between "$9,800" and "$11k".
 function fmt$(v, opts){
   opts = opts || {};
-  const compact = opts.compact !== false;          // default: compact ≥10k
-  const signed  = !!opts.signed;
+  const compactMode = ('compact' in opts) ? opts.compact : true;  // true | false | 'force'
+  const signed = !!opts.signed;
   const num = Number(v) || 0;
   const abs = Math.abs(num);
-  const body = (compact && abs >= 10000)
-    ? `$${(abs/1000).toFixed(abs >= 100000 ? 0 : 1)}k`
+  const useCompact = compactMode === 'force'
+    ? abs >= 1000
+    : compactMode && abs >= 100000;
+  const body = useCompact
+    ? `$${(abs/1000).toFixed(abs >= 1000000 ? 0 : 0)}k`
     : `$${Math.round(abs).toLocaleString()}`;
   if (signed) return (num < 0 ? "-" : "+") + body;
   return (num < 0 ? "-" : "") + body;
@@ -950,10 +959,21 @@ function runSimulation(){
       const slRate=sims.filter(s=>s.stopped_loss).length/n;
       const tpRate=sims.filter(s=>s.stopped_profit).length/n;
       const avgDD=sims.reduce((a,s)=>a+s.max_drawdown,0)/n;
+      // Median max-drawdown — robust to early-ruin runs that dominate the mean.
+      const ddSorted=sims.map(s=>s.max_drawdown).sort((a,b)=>a-b);
+      const medianDD=ddSorted[Math.floor(ddSorted.length/2)];
       const profitChance=sims.filter(s=>s.final_bankroll>startB).length/n;
       const totalProfit=finals.reduce((a,f)=>a+(f-startB),0);
       const totalHandsPlayed=sims.reduce((a,s)=>a+Math.max(s.hands_played||numH,1),0);
-      const evPerHand=totalProfit/Math.max(totalHandsPlayed,1);
+      // EV/Hand divides by INTENDED hands (n × numH), not played hands.
+      // Otherwise a martingale that ruins at hand 5 with -$5,000 gets divided
+      // by ~5 instead of ~2,000, producing a misleadingly large per-hand
+      // number that doesn't compare apples-to-apples with longer-surviving
+      // strategies. Keep evPerPlayedHand around for callers that want the
+      // alternative denominator.
+      const totalIntendedHands=n*numH;
+      const evPerHand=totalProfit/Math.max(totalIntendedHands,1);
+      const evPerPlayedHand=totalProfit/Math.max(totalHandsPlayed,1);
 
       // Survival-duration metrics — when do strategies typically fold?
       const handsLasted=sims.map(s=>s.hands_played||numH).sort((a,b)=>a-b);
@@ -1034,14 +1054,17 @@ function runSimulation(){
         p90:Math.round(pctOf(finals,0.90)*100)/100,
         p95:Math.round(pctOf(finals,0.95)*100)/100,
         n_sims: n,                                          // for CI / pin-overlay
-        ruin_count: sims.filter(s=>s.ruined).length,        // for Wilson CI
+        ruin_count: sims.filter(s=>s.ruined).length,        // for Wilson CI on Ruin %
+        profit_count: sims.filter(s=>s.final_bankroll>startB).length, // for Wilson CI on Profit %
         ruin_rate:Math.round(ruinRate*1e4)/1e4,
         stopped_loss_rate:Math.round(slRate*1e4)/1e4,
         stopped_profit_rate:Math.round(tpRate*1e4)/1e4,
         avg_max_drawdown:Math.round(avgDD*1e4)/1e4,
+        median_max_drawdown:Math.round(medianDD*1e4)/1e4,
         roi:Math.round((mean-startB)/startB*1e4)/100,
         profit_chance_pct:Math.round(profitChance*1e4)/100,
         ev_per_hand:Math.round(evPerHand*1e4)/1e4,
+        ev_per_played_hand:Math.round(evPerPlayedHand*1e4)/1e4,
         median_profit:Math.round((median-startB)*100)/100,
         avg_hands_lasted:Math.round(avgHandsLasted*10)/10,
         median_hands_lasted:Math.round(medianHandsLasted),
@@ -1080,6 +1103,22 @@ function runSimulation(){
       results[sKey]={meta:STRATEGIES[sKey],sims,live_hands:liveHands,summary};
     }
     state.results=results;
+    // Capture the config the run actually used so pinLabel never reflects
+    // a sidebar that's drifted since this run completed.
+    state.runConfig={
+      decks: state.settings.decks,
+      penetration: state.settings.penetration,
+      tableMin: state.settings.tableMin,
+      tableMax: state.settings.tableMax,
+      bjPays: state.settings.bjPays,
+      dealerS17: state.settings.dealerS17,
+      bankroll: state.sim.bankroll,
+      hands: state.sim.hands,
+      sims: state.sim.sims,
+      stopLossPct: state.risk.stopLossPct,
+      takeProfitPct: state.risk.takeProfitPct,
+      activeStrategies: [...state.activeStrategies],
+    };
     document.getElementById("empty-state").style.display="none";
     renderCurrentTab();
     btn.disabled=false; btn.textContent="RUN SIMULATION";
@@ -1104,19 +1143,30 @@ function togglePin(){
       const r=state.results[sKey];
       snap[sKey]={ meta:r.meta, summary:r.summary };  // shallow snapshot — summary already plain JSON
     }
+    // Snapshot the run config too — pinLabel reads from it so the label
+    // always describes the data that's pinned, never a drifted sidebar.
+    const cfg=state.runConfig||snapshotCurrentConfig();
     state.pinned={
       results: snap,
-      label: pinLabel(),
+      runConfig: cfg,
+      label: pinLabel(cfg),
       pinnedAt: Date.now(),
     };
   }
   updatePinButton();
   if(state.results) renderCurrentTab();
 }
-function pinLabel(){
-  // Compact one-liner describing the run that's being pinned.
+function snapshotCurrentConfig(){
+  // Fallback used only if a Pin happens before any RUN populated state.runConfig.
   const s=state.settings, sm=state.sim;
-  return `${s.decks}d · ${s.penetration}% pen · $${sm.bankroll.toLocaleString()} br · ${sm.hands.toLocaleString()}h × ${sm.sims} sims`;
+  return { decks:s.decks, penetration:s.penetration, tableMin:s.tableMin, tableMax:s.tableMax,
+           bjPays:s.bjPays, dealerS17:s.dealerS17, bankroll:sm.bankroll, hands:sm.hands,
+           sims:sm.sims, activeStrategies:[...state.activeStrategies] };
+}
+function pinLabel(cfg){
+  // Compact one-liner describing the pinned run. Reads from the captured
+  // runConfig, NEVER from the live sidebar (which may have drifted).
+  return `${cfg.decks}d · ${cfg.penetration}% pen · $${cfg.bankroll.toLocaleString()} br · ${cfg.hands.toLocaleString()}h × ${cfg.sims} sims`;
 }
 function updatePinButton(){
   const btn=document.getElementById("pin-btn");
@@ -1152,6 +1202,14 @@ function switchTab(tab){
   if(tab!=="live") stopLive();
   if(tab==="sweep") { renderSweep(); document.getElementById("empty-state").style.display="none"; }
   else if(state.results) renderCurrentTab();
+  // Pin doesn't apply to Sweep (it has its own per-point series), so hide
+  // the button there to avoid implying it does. updatePinButton restores it
+  // on every other tab.
+  const pinBtn=document.getElementById("pin-btn");
+  if(pinBtn){
+    if(tab==="sweep") pinBtn.style.display="none";
+    else updatePinButton();
+  }
 }
 
 function renderCurrentTab(){
@@ -1236,19 +1294,28 @@ function renderBankroll(){
 
   // ── Pinned overlay: dotted ghost line per strategy from the prior snapshot ──
   if(state.pinned){
+    const xDomMax=x.domain()[1];
     for(const sKey of keys){
       const pin=state.pinned.results[sKey];
       if(!pin || !pin.summary || !pin.summary.curves) continue;
+      // Clamp to current x-domain so a longer pinned run doesn't run off
+      // the chart's right edge.
+      const clamped=pin.summary.curves.filter(d=>d.hand<=xDomMax);
+      if(clamped.length<2) continue;
       const col=STRATEGIES[sKey].color;
       const lineP=d3.line().x(d=>x(d.hand)).y(d=>y(d.median)).curve(d3.curveMonotoneX);
-      svg.append("path").datum(pin.summary.curves).attr("d",lineP)
+      svg.append("path").datum(clamped).attr("d",lineP)
         .attr("fill","none").attr("stroke",col).attr("stroke-width",1.6)
         .attr("stroke-dasharray","2,4").attr("opacity",0.65);
     }
-    // Label the overlay so users know what the dotted line is.
+    // Compose the caption — append "(omitted: x, y)" when pinned strategies aren't shown.
+    const pinKeys=Object.keys(state.pinned.results);
+    const curSet=new Set(keys);
+    const omitted=pinKeys.filter(k=>!curSet.has(k)).map(k=>STRATEGIES[k]?.name||k);
+    const omitTxt=omitted.length?`  ·  omitted: ${omitted.join(", ")}`:"";
     svg.append("text").attr("x",width-6).attr("y",14).attr("text-anchor","end")
       .attr("font-family","var(--font-mono)").attr("font-size",10).attr("fill","#ffd54f")
-      .text(`◌ pinned: ${state.pinned.label}`);
+      .text(`◌ pinned: ${state.pinned.label}${omitTxt}`);
   }
 
   // Tooltip — also shows "X/N still alive" so users see the survivor-bias
@@ -1431,27 +1498,38 @@ function renderDistribution(){
     // ── Pinned overlay: thin gold-tinted ghost of prior cumulative-exit curves ──
     if(state.pinned){
       const pinSteps=80;
+      const xDomMax=xS.domain()[1];
       for(const sKey of keys){
         const pin=state.pinned.results[sKey];
         if(!pin || !pin.summary || !pin.summary.outcomes) continue;
         const pOuts=pin.summary.outcomes;
         const pTotal=pOuts.length||1;
         const pExitH=pOuts.filter(o=>o.outcome==="ruined"||o.outcome==="stopped_loss").map(o=>o.hands).sort((a,b)=>a-b);
-        const pHandsTotal=pin.summary.curves?pin.summary.curves[pin.summary.curves.length-1].hand:numH;
+        // Use the SHORTER of pinned-run length and current x-domain so the ghost
+        // never extends beyond the chart's right edge.
+        const pHandsTotal=Math.min(
+          pin.summary.curves?pin.summary.curves[pin.summary.curves.length-1].hand:numH,
+          xDomMax
+        );
         const pPts=[];
         for(let i=0;i<=pinSteps;i++){
           const h=Math.round(pHandsTotal*i/pinSteps);
           pPts.push({hand:h, exit_pct:pExitH.filter(rh=>rh<=h).length/pTotal*100});
         }
+        if(pPts.length<2) continue;
         const col=STRATEGIES[sKey].color;
         const lineP=d3.line().x(d=>xS(d.hand)).y(d=>yS(d.exit_pct)).curve(d3.curveStepAfter);
         svg.append("path").datum(pPts).attr("d",lineP)
           .attr("fill","none").attr("stroke",col).attr("stroke-width",1.3)
           .attr("stroke-dasharray","2,4").attr("opacity",0.55);
       }
+      const pinKeys=Object.keys(state.pinned.results);
+      const curSet=new Set(keys);
+      const omitted=pinKeys.filter(k=>!curSet.has(k)).map(k=>STRATEGIES[k]?.name||k);
+      const omitTxt=omitted.length?`  ·  omitted: ${omitted.join(", ")}`:"";
       svg.append("text").attr("x",width-6).attr("y",13).attr("text-anchor","end")
         .attr("font-family","var(--font-mono)").attr("font-size",9.5).attr("fill","#ffd54f")
-        .text(`◌ pinned: ${state.pinned.label}`);
+        .text(`◌ pinned: ${state.pinned.label}${omitTxt}`);
     }
 
     const tooltip=document.getElementById("tooltip");
@@ -1666,18 +1744,25 @@ function renderSurvival(){
 
     // Pinned overlay: thin dotted ghost per strategy from prior snapshot.
     if(state.pinned){
+      const xDomMax=x.domain()[1];
       for(const sKey of keys){
         const pin=state.pinned.results[sKey];
         if(!pin || !pin.summary || !pin.summary.curves) continue;
+        const clamped=pin.summary.curves.filter(d=>d.hand<=xDomMax);
+        if(clamped.length<2) continue;
         const col=STRATEGIES[sKey].color;
         const lineP=d3.line().x(d=>x(d.hand)).y(d=>y(d[metric])).curve(d3.curveMonotoneX);
-        svg.append("path").datum(pin.summary.curves).attr("d",lineP)
+        svg.append("path").datum(clamped).attr("d",lineP)
           .attr("fill","none").attr("stroke",col).attr("stroke-width",1.4)
           .attr("stroke-dasharray","2,4").attr("opacity",0.6);
       }
+      const pinKeys=Object.keys(state.pinned.results);
+      const curSet=new Set(keys);
+      const omitted=pinKeys.filter(k=>!curSet.has(k)).map(k=>STRATEGIES[k]?.name||k);
+      const omitTxt=omitted.length?`  ·  omitted: ${omitted.join(", ")}`:"";
       svg.append("text").attr("x",width-6).attr("y",13).attr("text-anchor","end")
         .attr("font-family","var(--font-mono)").attr("font-size",9.5).attr("fill","#ffd54f")
-        .text(`◌ pinned: ${state.pinned.label}`);
+        .text(`◌ pinned: ${state.pinned.label}${omitTxt}`);
     }
 
     const tooltip=document.getElementById("tooltip");
@@ -1756,15 +1841,15 @@ function renderStats(){
 
   let html=`<table class="stats-table"><thead><tr>
     <th>Strategy</th>
-    <th ${tip("Percent of simulations that finished above the starting bankroll. The headline 'did I win money?' metric.")}>Profit %</th>
-    <th ${tip("Percent of simulations where the player could no longer place a legal bet (bankroll < table min, or the strategy demanded more than the table max, or more than the bankroll could cover). The ± value is a 95% Wilson confidence interval based on the sim count — wider when you've run fewer sims.")}>Ruin % <span style="color:#666;font-weight:400">(95% CI)</span></th>
+    <th ${tip("Percent of simulations that finished above the starting bankroll. The bracketed range is a 95% Wilson confidence interval based on the sim count — Wilson is asymmetric near 0% and 100%, which is why it's not shown as ±.")}>Profit % <span style="color:#666;font-weight:400">(95% CI)</span></th>
+    <th ${tip("Percent of simulations where the player could no longer place a legal bet (bankroll < table min, or the strategy demanded more than the table max, or more than the bankroll could cover). The bracketed range is a 95% Wilson confidence interval — wider when you've run fewer sims.")}>Ruin % <span style="color:#666;font-weight:400">(95% CI)</span></th>
     <th ${tip("Final bankroll of the median (50th percentile) simulation. More robust than the mean for heavy-tailed payoff distributions.")}>Median</th>
     <th>Mean</th>
-    <th ${tip("Average profit per hand actually played, across all simulations. Negative means the strategy bleeds money on every hand on average.")}>EV/Hand</th>
+    <th ${tip("Average profit per INTENDED hand (denominator = num_sims × num_hands). Using intended hands rather than played hands keeps strategies comparable: an early-ruin strategy doesn't get its losses divided by a tiny denominator and look better than it is. Negative means the strategy bleeds money on average.")}>EV/Hand</th>
     <th>Std Dev</th>
     <th ${tip("5th percentile final bankroll — 95% of sims finished at or above this. The 'bad-but-not-worst-case' floor.")}>P5</th>
     <th ${tip("95th percentile final bankroll — only 5% of sims finished above this. The 'good-but-not-best-case' ceiling. P5/P95 are far more stable than Min/Max for 50-sim runs.")}>P95</th>
-    <th ${tip("Maximum drawdown — largest % decline from a running peak bankroll, averaged across sims. Always 0–100%.")}>Max DD</th>
+    <th ${tip("Maximum drawdown — largest % decline from a running peak bankroll. Headline value is the MEDIAN across sims (the typical run); the smaller number underneath is the MEAN, which gets dragged toward 100% by early-ruin runs and is less interpretable.")}>Max DD <span style="color:#666;font-weight:400">(med · mean)</span></th>
     <th ${tip("Average number of hands the player actually got to play before the run ended (ruin, stop-loss, take-profit, or session end). For ruin-prone strategies this is the 'how soon does the wheel come off?' number.")}>Avg Survival</th>
   </tr></thead><tbody>`;
   for(const sKey of sortedKeys){
@@ -1776,19 +1861,27 @@ function renderStats(){
     const meanRoiSuffix=`<span style="font-size:10px;color:#666">(${s.roi>0?"+":""}${s.roi}%)</span>`;
     const tagsHTML=(s.tags||[]).map(tagBadge).join(" ");
     const warningHTML=s.warning?`<div style="font:600 10px var(--font-mono);color:#ffa726;margin-top:3px">⚠ ${s.warning}</div>`:"";
-    // Wilson 95% CI half-width on the ruin rate.
-    const ruinCount = (s.ruin_count!=null) ? s.ruin_count : Math.round((s.ruin_rate||0) * (s.n_sims||state.sim.sims));
-    const ruinCI = wilson95(ruinCount, s.n_sims||state.sim.sims);
-    const ciHalfPct = (ruinCI.half*100).toFixed(1);
+    // 95% Wilson confidence intervals for Ruin and Profit proportions.
+    // Shown as [lo, hi] because Wilson is asymmetric near 0/100 — a symmetric
+    // ± would mislead, e.g. "0% ± 3.6%" implies negative is plausible (it isn't).
+    const N = s.n_sims || state.sim.sims;
+    const ruinCount   = (s.ruin_count!=null)   ? s.ruin_count   : Math.round((s.ruin_rate||0)*N);
+    const profitCount = (s.profit_count!=null) ? s.profit_count : Math.round((s.profit_chance_pct||0)/100*N);
+    const ruinCI   = wilson95(ruinCount,   N);
+    const profitCI = wilson95(profitCount, N);
+    const fmtCI = ci => `[${(ci.lo*100).toFixed(1)}%, ${(ci.hi*100).toFixed(1)}%]`;
     html+=`<tr style="border-left:3px solid ${profitColor}">
       <td>
         <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${m.color};margin-right:8px;vertical-align:middle"></span>${m.name}
         <div style="margin-top:6px">${tagsHTML}</div>${warningHTML}
       </td>
-      <td style="color:${profitColor};font-weight:700">${(s.profit_chance_pct||0).toFixed(1)}%</td>
+      <td>
+        <div style="color:${profitColor};font-weight:700">${(s.profit_chance_pct||0).toFixed(1)}%</div>
+        <div style="font:9px var(--font-mono);color:#888">${fmtCI(profitCI)}</div>
+      </td>
       <td>
         <div style="color:${ruinColor};font-weight:700">${(s.ruin_rate*100).toFixed(1)}%</div>
-        <div style="font:9px var(--font-mono);color:#888">± ${ciHalfPct}%</div>
+        <div style="font:9px var(--font-mono);color:#888">${fmtCI(ruinCI)}</div>
       </td>
       <td style="color:${medColor};font-weight:700">${fmtK(s.median)}</td>
       <td>${fmtK(s.mean)} ${meanRoiSuffix}</td>
@@ -1796,7 +1889,10 @@ function renderStats(){
       <td>${fmtK(s.std)}</td>
       <td style="color:#ef535088">${fmtK(s.p5)}</td>
       <td style="color:#66bb6a88">${fmtK(s.p95)}</td>
-      <td style="color:#ffa726">${(s.avg_max_drawdown*100).toFixed(1)}%</td>
+      <td>
+        <div style="color:#ffa726;font-weight:700">${((s.median_max_drawdown||s.avg_max_drawdown)*100).toFixed(1)}%</div>
+        <div style="font:9px var(--font-mono);color:#888">mean ${(s.avg_max_drawdown*100).toFixed(1)}%</div>
+      </td>
       <td>
         <div style="font-weight:700">${(s.avg_hands_lasted||state.sim.hands).toLocaleString()}</div>
         <div style="font:9px var(--font-mono);color:#666">of ${state.sim.hands.toLocaleString()} planned</div>
