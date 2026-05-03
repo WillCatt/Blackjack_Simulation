@@ -363,6 +363,126 @@
     .app { flex-direction: column; height: auto; }
     .sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--border); }
   }
+
+  /* ── Info-icon affordance: visible in-context "what does this mean?" ─────────
+     Renders a small ⓘ that hovers a tooltip; clicking jumps to an INFO anchor. */
+  .infoIcon {
+    display: inline-block;
+    width: 14px; height: 14px;
+    margin-left: 5px;
+    border-radius: 50%;
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    font: 700 10px var(--font-mono);
+    line-height: 14px;
+    text-align: center;
+    cursor: help;
+    border: 1px solid var(--border);
+    vertical-align: middle;
+    transition: all 0.12s;
+    text-decoration: none;
+  }
+  .infoIcon:hover {
+    background: var(--gold-dim);
+    color: var(--gold);
+    border-color: var(--gold);
+  }
+
+  /* ── INFO page ──────────────────────────────────────────────────────────── */
+  .info-doc { max-width: 980px; margin: 0 auto; padding: 6px 4px 60px; }
+  .info-doc h2 {
+    font: 700 13px var(--font-mono);
+    color: var(--gold);
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin: 28px 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .info-doc h2:first-child { margin-top: 6px; }
+  .info-doc h3 {
+    font: 600 14px var(--font-sans);
+    color: var(--text-primary);
+    margin: 18px 0 6px;
+  }
+  .info-doc p {
+    font: 400 13.5px var(--font-sans);
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin: 6px 0 10px;
+  }
+  .info-doc code {
+    background: var(--bg-elevated);
+    color: var(--gold);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font: 12px var(--font-mono);
+  }
+  .info-doc .strat-card {
+    background: var(--bg-elevated);
+    border-left: 3px solid var(--gold);
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin: 10px 0;
+  }
+  .info-doc .strat-card h3 {
+    margin-top: 0;
+    color: var(--gold);
+    font: 700 13px var(--font-mono);
+    letter-spacing: 0.5px;
+  }
+  .info-doc .strat-card .verdict {
+    font: 11px var(--font-mono);
+    color: var(--text-muted);
+    margin-top: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .info-doc .glossary {
+    display: grid;
+    grid-template-columns: 180px 1fr;
+    gap: 10px 18px;
+    margin: 8px 0;
+    font: 13px var(--font-sans);
+  }
+  .info-doc .glossary dt {
+    font: 600 12.5px var(--font-mono);
+    color: var(--text-primary);
+  }
+  .info-doc .glossary dd {
+    color: var(--text-secondary);
+    margin: 0;
+    line-height: 1.5;
+  }
+  .info-doc .toc-strip {
+    display: flex; flex-wrap: wrap; gap: 6px;
+    margin: 4px 0 14px;
+  }
+  .info-doc .toc-strip a {
+    padding: 4px 10px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text-secondary);
+    text-decoration: none;
+    font: 600 10px var(--font-mono);
+    letter-spacing: 0.5px;
+  }
+  .info-doc .toc-strip a:hover {
+    color: var(--gold);
+    border-color: var(--gold);
+  }
+  .info-doc .callout {
+    background: var(--bg-elevated);
+    border-left: 3px solid var(--text-muted);
+    padding: 10px 14px;
+    margin: 12px 0;
+    font: 13px var(--font-sans);
+    color: var(--text-secondary);
+    line-height: 1.55;
+  }
+  .info-doc .callout.warn { border-left-color: #ef5350; }
+  .info-doc .callout.note { border-left-color: var(--gold); }
 </style>
 </head>
 <body>
@@ -380,7 +500,8 @@
     <button class="btn" id="tab-team" onclick="switchTab('team')">MIT TEAM</button>
     <button class="btn" id="tab-sweep" onclick="switchTab('sweep')">SWEEP</button>
     <button class="btn" id="tab-live" onclick="switchTab('live')">LIVE</button>
-    <button class="btn" id="pin-btn" onclick="togglePin()" title="Snapshot current results — they ghost onto the next run's charts so you can A/B by eye." style="display:none">PIN RUN</button>
+    <button class="btn" id="tab-info" onclick="switchTab('info')">INFO</button>
+    <button class="btn" id="pin-btn" onclick="togglePin()" title="Snapshot current results — they ghost onto the next run's charts so you can A/B by eye. Click the i in the INFO tab for full detail." style="display:none">PIN RUN</button>
     <button class="btn btn-gold" id="run-btn" onclick="runSimulation()">RUN SIMULATION</button>
   </div>
 </div>
@@ -416,6 +537,7 @@
     <div id="view-team" style="display:none;"></div>
     <div id="view-sweep" style="display:none;"></div>
     <div id="view-live" style="display:none;"></div>
+    <div id="view-info" style="display:none;"></div>
   </div>
 </div>
 
@@ -1192,22 +1314,21 @@ function updatePinButton(){
 
 function switchTab(tab){
   state.currentTab=tab;
-  // The Sweep tab can render even before the main simulation has run, since it
-  // does its own sweep runs from scratch.
-  ["bankroll","distribution","survival","stats","team","sweep","live"].forEach(t=>{
+  // Sweep and Info can render even before the main simulation has run —
+  // Sweep does its own runs, Info is static reference content.
+  ["bankroll","distribution","survival","stats","team","sweep","live","info"].forEach(t=>{
     document.getElementById(`tab-${t}`).classList.toggle("active",t===tab);
-    const showAlways=(t==="sweep");
+    const showAlways=(t==="sweep"||t==="info");
     document.getElementById(`view-${t}`).style.display=t===tab && (state.results||showAlways)?"block":"none";
   });
   if(tab!=="live") stopLive();
   if(tab==="sweep") { renderSweep(); document.getElementById("empty-state").style.display="none"; }
+  else if(tab==="info") { renderInfo(); document.getElementById("empty-state").style.display="none"; }
   else if(state.results) renderCurrentTab();
-  // Pin doesn't apply to Sweep (it has its own per-point series), so hide
-  // the button there to avoid implying it does. updatePinButton restores it
-  // on every other tab.
+  // Pin doesn't apply to Sweep or Info (no overlay), so hide on those tabs.
   const pinBtn=document.getElementById("pin-btn");
   if(pinBtn){
-    if(tab==="sweep") pinBtn.style.display="none";
+    if(tab==="sweep"||tab==="info") pinBtn.style.display="none";
     else updatePinButton();
   }
 }
@@ -1237,7 +1358,7 @@ function renderBankroll(){
 
   const headerEl=document.createElement("div");
   headerEl.className="chart-header";
-  headerEl.innerHTML=`<span class="chart-label">BANKROLL OVER TIME</span><span class="chart-label">${state.sim.sims>1?"MEDIAN + P5/P95 BAND":"SINGLE RUN"}</span>`;
+  headerEl.innerHTML=`<span class="chart-label">BANKROLL OVER TIME${infoIcon("bankroll_chart")}</span><span class="chart-label">${state.sim.sims>1?"MEDIAN + P5/P95 BAND":"SINGLE RUN"}</span>`;
   wrap.appendChild(headerEl);
 
   const margin={top:20,right:30,bottom:40,left:65};
@@ -1383,7 +1504,7 @@ function renderDistribution(){
   const breakdownWrap=document.createElement("div");
   breakdownWrap.className="chart-container";
   breakdownWrap.style.marginBottom="14px";
-  breakdownWrap.innerHTML=`<div class="chart-header"><span class="chart-label">OUTCOME BREAKDOWN</span><span class="chart-label">SHARE OF SIMS BY EXIT CONDITION</span></div>`;
+  breakdownWrap.innerHTML=`<div class="chart-header"><span class="chart-label">OUTCOME BREAKDOWN${infoIcon("outcome_breakdown")}</span><span class="chart-label">SHARE OF SIMS BY EXIT CONDITION</span></div>`;
   container.appendChild(breakdownWrap);
 
   const breakdownInner=document.createElement("div");
@@ -1440,7 +1561,7 @@ function renderDistribution(){
   const ruinWrap=document.createElement("div");
   ruinWrap.className="chart-container";
   ruinWrap.style.marginBottom="14px";
-  ruinWrap.innerHTML=`<div class="chart-header"><span class="chart-label">CUMULATIVE BANKRUPTCY BY HAND</span><span class="chart-label">% OF SIMS BUSTED ≤ HAND H</span></div>`;
+  ruinWrap.innerHTML=`<div class="chart-header"><span class="chart-label">CUMULATIVE BANKRUPTCY BY HAND${infoIcon("cum_bankrupt")}</span><span class="chart-label">% OF SIMS BUSTED ≤ HAND H</span></div>`;
   container.appendChild(ruinWrap);
 
   {
@@ -1568,7 +1689,7 @@ function renderDistribution(){
   tlHeader.className="chart-header";
   const tlLbl=document.createElement("span");
   tlLbl.className="chart-label";
-  tlLbl.textContent="TERMINATION TIMELINE  ·  ROW = ONE SIM, BAR LENGTH = HANDS LASTED";
+  tlLbl.innerHTML="TERMINATION TIMELINE  ·  ROW = ONE SIM, BAR LENGTH = HANDS LASTED"+infoIcon("termination_timeline");
   tlHeader.appendChild(tlLbl);
   const tlBtns=document.createElement("div");
   tlBtns.className="dist-buttons";
@@ -1700,7 +1821,8 @@ function renderSurvival(){
     const wrap=document.createElement("div");
     wrap.className="chart-container";
     wrap.style.marginBottom="14px";
-    wrap.innerHTML=`<div class="chart-header"><span class="chart-label">${title}</span><span class="chart-label">% OF SIMULATIONS</span></div>`;
+    const iconKey = metric==="survival_pct" ? "survival_chart" : "profit_chart";
+    wrap.innerHTML=`<div class="chart-header"><span class="chart-label">${title}${infoIcon(iconKey)}</span><span class="chart-label">% OF SIMULATIONS</span></div>`;
     container.appendChild(wrap);
 
     const margin={top:20,right:30,bottom:40,left:60};
@@ -1841,16 +1963,16 @@ function renderStats(){
 
   let html=`<table class="stats-table"><thead><tr>
     <th>Strategy</th>
-    <th ${tip("Percent of simulations that finished above the starting bankroll. The bracketed range is a 95% Wilson confidence interval based on the sim count — Wilson is asymmetric near 0% and 100%, which is why it's not shown as ±.")}>Profit % <span style="color:#666;font-weight:400">(95% CI)</span></th>
-    <th ${tip("Percent of simulations where the player could no longer place a legal bet (bankroll < table min, or the strategy demanded more than the table max, or more than the bankroll could cover). The bracketed range is a 95% Wilson confidence interval — wider when you've run fewer sims.")}>Ruin % <span style="color:#666;font-weight:400">(95% CI)</span></th>
-    <th ${tip("Final bankroll of the median (50th percentile) simulation. More robust than the mean for heavy-tailed payoff distributions.")}>Median</th>
+    <th>Profit % <span style="color:#666;font-weight:400">(95% CI)</span>${infoIcon("profit_pct")}</th>
+    <th>Ruin % <span style="color:#666;font-weight:400">(95% CI)</span>${infoIcon("ruin")}</th>
+    <th>Median${infoIcon("median")}</th>
     <th>Mean</th>
-    <th ${tip("Average profit per INTENDED hand (denominator = num_sims × num_hands). Using intended hands rather than played hands keeps strategies comparable: an early-ruin strategy doesn't get its losses divided by a tiny denominator and look better than it is. Negative means the strategy bleeds money on average.")}>EV/Hand</th>
-    <th>Std Dev</th>
-    <th ${tip("5th percentile final bankroll — 95% of sims finished at or above this. The 'bad-but-not-worst-case' floor.")}>P5</th>
-    <th ${tip("95th percentile final bankroll — only 5% of sims finished above this. The 'good-but-not-best-case' ceiling. P5/P95 are far more stable than Min/Max for 50-sim runs.")}>P95</th>
-    <th ${tip("Maximum drawdown — largest % decline from a running peak bankroll. Headline value is the MEDIAN across sims (the typical run); the smaller number underneath is the MEAN, which gets dragged toward 100% by early-ruin runs and is less interpretable.")}>Max DD <span style="color:#666;font-weight:400">(med · mean)</span></th>
-    <th ${tip("Average number of hands the player actually got to play before the run ended (ruin, stop-loss, take-profit, or session end). For ruin-prone strategies this is the 'how soon does the wheel come off?' number.")}>Avg Survival</th>
+    <th>EV/Hand${infoIcon("ev_per_hand")}</th>
+    <th>Std Dev${infoIcon("std")}</th>
+    <th>P5${infoIcon("p5_p95")}</th>
+    <th>P95</th>
+    <th>Max DD <span style="color:#666;font-weight:400">(med · mean)</span>${infoIcon("max_dd")}</th>
+    <th>Avg Survival${infoIcon("avg_survival")}</th>
   </tr></thead><tbody>`;
   for(const sKey of sortedKeys){
     const d=state.results[sKey]; if(!d) continue;
@@ -1980,7 +2102,7 @@ function renderTeam(){
   wrap.className="chart-container";
   wrap.innerHTML=`
     <div class="chart-header">
-      <span class="chart-label">TEAM BANKROLL  ·  BIG PLAYER DRIVES ALL VOLATILITY</span>
+      <span class="chart-label">TEAM BANKROLL  ·  BIG PLAYER DRIVES ALL VOLATILITY${infoIcon("team_chart")}</span>
       <span class="chart-label">${_sims.length>1?`MEDIAN-FINAL RUN  (#${_medianRunIdx+1} of ${_sims.length})`:"SINGLE RUN"}  ·  HOVER FOR PER-ROLE P/L</span>
     </div>`;
   container.appendChild(wrap);
@@ -2298,7 +2420,7 @@ function renderSweep(){
   controls.style.cssText="margin-bottom:14px;padding:14px 16px;";
   container.appendChild(controls);
 
-  controls.innerHTML=`<div class="chart-header"><span class="chart-label">HYPERPARAMETER SWEEP</span><span class="chart-label">${state.activeStrategies.size} STRATEGIES × ${state.sweep.simsPerPoint} SIMS × ${state.sweep.handsPerPoint} HANDS</span></div>`;
+  controls.innerHTML=`<div class="chart-header"><span class="chart-label">HYPERPARAMETER SWEEP${infoIcon("sweep")}</span><span class="chart-label">${state.activeStrategies.size} STRATEGIES × ${state.sweep.simsPerPoint} SIMS × ${state.sweep.handsPerPoint} HANDS</span></div>`;
 
   // Holding-constant context line — surfaces what every sweep point will hold steady
   const holding=document.createElement("div");
@@ -2674,6 +2796,201 @@ function renderSweepCharts(container){
   container.appendChild(summary);
 }
 
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INFO TAB — comprehensive reference. Glossary entries here are also surfaced
+// inline via the ⓘ icons on chart headers and stats columns; the icons link
+// back here using #info-<anchor> hashes so users can jump to the full entry.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Single source of truth for every metric / chart label that gets an ⓘ icon.
+// `infoIcon('ruin')` renders a clickable hover icon; the same key is the anchor
+// in renderInfo() so the icon scrolls there on click.
+const INFO_ENTRIES = {
+  // ── Strategy concepts ────────────────────────────────────────────────────
+  basic_strategy:  { title:"Basic Strategy",
+                     short:"The mathematically optimal hit/stand/double/split decision for every starting-hand-vs-dealer-upcard combination, assuming no count info. Every strategy in this lab uses identical play decisions — they only differ in BET SIZING." },
+  flat:            { title:"Flat Bet",
+                     short:"Bet the same amount every hand. The control group — what you'd lose to house edge with no betting system at all." },
+  martingale:      { title:"Martingale",
+                     short:"Double after every loss; reset after a win. Each cycle ALWAYS recovers losses + 1 unit — until you hit table-max or run out of bankroll. Famously self-destructive." },
+  paroli:          { title:"Paroli (Reverse Martingale)",
+                     short:"Double after every WIN, reset after a loss or after 3 wins in a row. Tries to ride streaks; risks little of bankroll but gives back gains quickly." },
+  oneThreeTwoSix:  { title:"1-3-2-6 System",
+                     short:"Bet 1, 3, 2, 6 units after consecutive wins. Reset on any loss or after completing the cycle. Locks in profit at step 3 (units 1+3-2 = 2)." },
+  oscar:           { title:"Oscar's Grind",
+                     short:"After a win, increase bet by 1 unit. After a loss, hold the bet. Target: profit of exactly +1 unit per cycle. Slow grinder, vulnerable to long downswings." },
+  hilo:            { title:"Hi-Lo Card Counting",
+                     short:"Tag cards 2-6 as +1, 10-A as -1. Convert the running count to a 'true count' by dividing by remaining decks. Bet bigger when TC is positive (more tens left = better player odds)." },
+  hilo_cheat:      { title:"Hi-Lo Cheat",
+                     short:"Same idea as Hi-Lo, but reads the EXACT true count off remaining cards instead of mentally tallying. Approximates a perfect counter with no mistakes — UNREALISTIC, included as a ceiling reference." },
+  mit_team:        { title:"MIT Team",
+                     short:"Three-actor blackjack team — Spotter, Controller, Big Player — sharing one bankroll. Spotter & Controller scout the count; the Big Player only swoops in on hot shoes (TC ≥ +2) and bets HUGE." },
+  // ── Metrics ──────────────────────────────────────────────────────────────
+  profit_pct:      { title:"Profit %",
+                     short:"Percent of simulations that finished above the starting bankroll. The headline 'did the strategy win money?' metric." },
+  ruin:            { title:"Ruin %",
+                     short:"Percent of sims where the player could no longer place a legal bet (bankroll < table_min, or the strategy demanded more than the table_max, or more than the bankroll could cover)." },
+  wilson:          { title:"95% Wilson CI",
+                     short:"The bracketed range under Profit %/Ruin % is a 95% Wilson confidence interval. Wider when fewer sims have been run. Asymmetric near 0% and 100% — that's why it's not shown as ±." },
+  median:          { title:"Median",
+                     short:"50th-percentile final bankroll. More robust than the mean for heavy-tailed strategies (Martingale, Paroli) where rare big wins drag the mean above zero while most runs ended in ruin." },
+  ev_per_hand:     { title:"EV / Hand",
+                     short:"Average profit per INTENDED hand (denominator = num_sims × num_hands). Using intended hands rather than played hands keeps strategies comparable: an early-ruin strategy doesn't get its losses divided by a tiny denominator and look better than it is." },
+  std:             { title:"Std Dev",
+                     short:"Standard deviation of final bankrolls. High values mean the strategy's outcomes are spread out — even when median is good, a high std means individual sessions can swing widely." },
+  p5_p95:          { title:"P5 / P95",
+                     short:"5th and 95th percentile finals — 90% of sims fell between them. Far more stable than Min/Max for 50-sim runs, where a single outlier can throw the extreme tails by orders of magnitude." },
+  max_dd:          { title:"Max Drawdown",
+                     short:"Largest % decline from a running peak bankroll within a single sim. Headline value is the MEDIAN across sims (typical run); the smaller mean number is dragged toward 100% by early-ruin sims." },
+  avg_survival:    { title:"Avg Survival",
+                     short:"Average number of hands the player got through before the run ended (ruin / stop-loss / take-profit / session end). For ruin-prone strategies this is the 'how soon does the wheel come off?' number." },
+  status_color:    { title:"Status colors",
+                     short:"GREEN: profit chance > 50%, median > start, ruin < 10%. AMBER: mixed signals. RED: ruin ≥ 25% OR median ≤ start OR drawdown ≥ 75%." },
+  // ── Chart concepts ───────────────────────────────────────────────────────
+  bankroll_chart:  { title:"Bankroll Chart",
+                     short:"Median bankroll over time per strategy. Shaded band shows the P5–P95 percentile spread across all sims. Tooltip shows X/N sims still alive — when N drops below half, the median is conditioned on survivors only (survivor bias)." },
+  survival_chart:  { title:"Survival Curve",
+                     short:"Percent of sims still able to play at hand H. A steep drop tells you the strategy collapses early; a flat line at 100% means everyone survived to the end." },
+  profit_chart:    { title:"Profit Probability Curve",
+                     short:"Percent of sims with bankroll > start at hand H. Falling below the 50% reference line means the strategy is losing more often than it wins as time progresses." },
+  outcome_breakdown:{ title:"Outcome Breakdown",
+                     short:"Stacked bar of how every sim exited: ruined, stop-loss, loss-but-survived, break-even, profit, take-profit. The bankrupt-to-profit ratio at the bottom is a single-number safety check." },
+  cum_bankrupt:    { title:"Cumulative Bankruptcy",
+                     short:"Solid line: % of sims that exited (ruin OR stop-loss) by hand H. Dashed line: ruin only, no stop-loss. The gap between them is how often risk controls saved a run from total ruin." },
+  termination_timeline:{ title:"Termination Timeline",
+                     short:"One row per sim, sorted by exit hand. Color = outcome. Lets you see at a glance whether ruins cluster early or late, and whether the strategy 'fails clean' (one mode) or 'fails ragged' (mixed exits)." },
+  pin_run:         { title:"Pin Run",
+                     short:"Snapshot the current results so they ghost onto your next run as a thin dotted overlay. Lets you A/B compare two configurations by eye without losing the prior baseline." },
+  team_chart:      { title:"MIT Team Chart",
+                     short:"Single team-bankroll line in Big Player color, shown for the run whose final is closest to the median. Hover for per-role cumulative P/L breakdown — Spotter, Controller, Big Player." },
+  sweep:           { title:"Hyperparameter Sweep",
+                     short:"Run the same strategy across a range of one parameter (decks, table-max, bankroll, etc.), holding the rest steady. Every other setting comes from your sidebar at the moment you hit RUN SWEEP." },
+};
+
+// Render a hover-able info icon. `key` must exist in INFO_ENTRIES.
+// Click jumps to the matching anchor in the INFO tab.
+function infoIcon(key){
+  const e=INFO_ENTRIES[key];
+  if(!e) return "";
+  const tipText=`${e.title} — ${e.short}`.replace(/"/g,"&quot;");
+  return `<a href="#info-${key}" class="infoIcon" title="${tipText}" onclick="switchTab('info');setTimeout(()=>{const t=document.getElementById('info-${key}');if(t)t.scrollIntoView({behavior:'smooth',block:'start'});},50);return false;">i</a>`;
+}
+
+function renderInfo(){
+  const container=document.getElementById("view-info");
+  // Build once — content is static.
+  if(container.dataset.built==="1") return;
+  container.dataset.built="1";
+
+  // Strategy cards built from INFO_ENTRIES so descriptions stay single-source.
+  const stratKey=k=>INFO_ENTRIES[k];
+  const stratCard=(k, longBody, verdict)=>{
+    const e=stratKey(k);
+    return `<div class="strat-card" id="info-${k}">
+      <h3>${e.title}</h3>
+      <p>${longBody}</p>
+      ${verdict?`<div class="verdict">${verdict}</div>`:""}
+    </div>`;
+  };
+
+  const glossEntry=(k, body)=>`<dt id="info-${k}">${INFO_ENTRIES[k].title}</dt><dd>${body}</dd>`;
+
+  container.innerHTML=`
+    <div class="info-doc">
+
+      <h2>About this lab</h2>
+      <p>This is a Monte Carlo blackjack simulator. You configure a table (decks, penetration, min/max bet, etc.), pick one or more <b>betting strategies</b>, and the engine plays through thousands of hands across many independent simulations. The tabs above visualize what those sims looked like — bankroll trajectories, survival rates, outcome distributions, statistical summaries, and a hyperparameter sweep tool for "what if I changed this one thing?" experiments.</p>
+      <div class="callout note"><b>One important separation:</b> every strategy in this lab uses the <i>same</i> hit/stand/double/split decisions — textbook basic strategy. The strategies differ purely in how they SIZE their bets. The only exceptions are the count-based ramps (Hi-Lo, Hi-Lo Cheat, MIT) which still play basic strategy on each hand but use the running count to scale up bets when the deck favors the player.</p></div>
+
+      <div class="toc-strip">
+        <a href="#info-basic_strategy">Play strategy</a>
+        <a href="#info-flat">Bet sizing</a>
+        <a href="#info-mit_team">MIT Team</a>
+        <a href="#info-profit_pct">Metrics glossary</a>
+        <a href="#info-bankroll_chart">Charts</a>
+        <a href="#info-pin_run">Pin / Sweep</a>
+      </div>
+
+      <h2>Play strategy (universal)</h2>
+      ${stratCard("basic_strategy",
+        "All play decisions follow textbook basic strategy. Hard hands: stand on 17+, stand on 13–16 against dealer 2–6, stand on 12 only against 4–6, double 11 always, double 10 against 2–9, double 9 against 3–6, hit otherwise. Soft hands (any total containing an ace counted as 11): stand soft 19+, hit soft 18 vs dealer 9+, double soft 13–18 against various weak dealer cards. Pairs: always split aces and 8s; split 9s except vs 7/10/A; split 7s vs 2–7; split 6s vs 2–6; split 2s and 3s vs 2–7; split 4s only vs 5–6.",
+        "These rules are the same for every strategy below.")}
+      <div class="callout">The dealer hits to 17 then either stops (S17, default) or hits soft 17 (H17), controlled by the sidebar Table Rules toggle. Dealer rule changes the player edge by ~0.2% — H17 favors the house slightly more.</div>
+
+      <h2>Bet-sizing strategies</h2>
+
+      ${stratCard("flat",
+        "Bet exactly the table minimum every hand, no exceptions. The cleanest baseline — your loss rate equals the house edge × hands played, with no betting-system distortion.",
+        "Best survival, smallest swings. Mildly negative EV.")}
+
+      ${stratCard("martingale",
+        "Start at table min. After every loss, double the next bet. After any win, reset to table min. The math says you'll always recover prior losses + 1 unit — the catch is that real tables have a max bet and you have a finite bankroll. After 7–8 consecutive losses (more common than people expect), the next required bet exceeds either the table max or your bankroll, the cycle breaks, and you've banked a catastrophic loss.",
+        "Highest ruin rate of any classical system. Heavy-tailed: most sims either eke out small wins or hit a wall and lose everything.")}
+
+      ${stratCard("paroli",
+        "Inverse of martingale. Bet table min. After every win, double. After 3 wins in a row, reset (lock in the streak gains). After any loss, reset. You only ever risk the original 1-unit stake on each cycle — the rest is house money — but you cap your wins, so you give back gains quickly when streaks die.",
+        "Low ruin, low EV. Variance comes from streaks rather than catastrophic losses.")}
+
+      ${stratCard("oneThreeTwoSix",
+        "Bet sequence is 1, 3, 2, 6 units after consecutive wins. After a loss or completing the cycle, reset. The clever bit: after step 2 (units 1+3-2=2 net), you've locked in profit even if step 4 loses. Designed to capture short streaks while limiting downside.",
+        "Conservative middle ground. Outcomes cluster near break-even with rare positive outliers.")}
+
+      ${stratCard("oscar",
+        "Each cycle targets exactly +1 unit profit. After a win, increase the bet by 1 unit. After a loss, hold the bet steady. Cycle ends when running profit reaches +1 unit, at which point you reset. Slow grinder; long losing streaks force the bet upward and can drain bankroll before the cycle completes.",
+        "Median outcomes look stable until you hit a 'grind streak' that ruins.")}
+
+      ${stratCard("hilo",
+        "Every card seen contributes ±1 to a running count: 2-6 are +1, 7-9 are 0, 10-A are -1. Convert running → true count by dividing by remaining decks. Bet table min when TC ≤ +1; ramp up to 2× / 4× / 8× / 12× as TC climbs. The intuition: high TC means lots of tens and aces left, which favors the player (more dealer busts, more blackjacks).",
+        "Mathematically sound. Real-world implementation requires perfect mental tracking and table conditions where casinos won't notice the bet ramping.")}
+
+      ${stratCard("hilo_cheat",
+        "Same betting ramp as Hi-Lo, but the engine reads the exact true count off the remaining shoe instead of relying on a player's mental count. This approximates a perfect counter with zero miscounts and zero count-loss from missed cards. Marked 'Cheating / invalid' in the stats — included only as an upper-bound reference for what perfect counting could achieve.",
+        "Use this strategy's results as a ceiling, not a goal.")}
+
+      <h2>The MIT Team strategy</h2>
+      ${stratCard("mit_team",
+        "Inspired by the famous MIT Blackjack Team. Three actors share one bankroll: SPOTTER plays table min on every hand, just to keep eyes on the cards and track the count. CONTROLLER plays a small ramp (1×–4× table min) keyed to the count, verifying the spotter's read. BIG PLAYER does NOT play normal hands — they wander the casino looking like a tourist. When the team signals a hot shoe (true count ≥ +2), Big Player swoops in and bets HUGE (15× to 60× table min depending on count). After the shoe cools, BP leaves the table.",
+        "All three actors draw from the SAME shared bankroll. Per-role analytics tracked as cumulative P/L contribution to the pool.")}
+      <div class="callout note"><b>What the chart shows.</b> The MIT TEAM tab plots a single team-bankroll line drawn in Big Player color (since BP drives almost all of the volatility). Hover anywhere to see per-role cumulative P/L — typically Spotter and Controller hover near zero (they're paying the house edge to maintain access), while Big Player swings wildly and produces almost all of the team's profit when the count breaks right.</div>
+
+      <h2>Metrics glossary</h2>
+      <p>The Stats table is the densest place these terms appear. Each header has an ⓘ icon — hover for the short version, click to jump back here for the full version.</p>
+      <dl class="glossary">
+        ${glossEntry("profit_pct", "Percent of simulations that finished above the starting bankroll. The first thing to look at when comparing strategies.")}
+        ${glossEntry("ruin", "Percent where the player could no longer place a legal bet — bankroll fell below the table min, or the strategy demanded more than the table max, or more than the bankroll could cover. Ruin is permanent in this engine; the run terminates immediately.")}
+        ${glossEntry("wilson", "95% confidence interval around a proportion (Ruin or Profit). With only 50 sims, an observed 8% ruin rate is statistically consistent with anywhere from ~3% to ~19% true ruin. The interval is asymmetric near 0% and 100% — that's why it's bracketed [lo, hi] not ±.")}
+        ${glossEntry("median", "50th-percentile final bankroll. We lead with median (not mean) for heavy-tailed strategies where rare big wins drag the mean above zero while most runs ended in ruin. Mean is shown alongside in parentheses with ROI.")}
+        ${glossEntry("ev_per_hand", "Average profit per INTENDED hand (denominator = num_sims × num_hands). Critical: using intended hands rather than played hands keeps strategies comparable. Otherwise a martingale that ruins at hand 5 with -$5,000 gets divided by ~5 instead of ~2,000, producing a misleadingly large per-hand number.")}
+        ${glossEntry("std", "Standard deviation of final bankrolls. High values mean outcomes are spread out — even when median is good, a high std means individual sessions can swing widely.")}
+        ${glossEntry("p5_p95", "5th and 95th percentile final bankrolls — 90% of sims fell between them. Stable estimators of the realistic outcome range. We show these instead of Min/Max because Min/Max are dominated by single outliers in 50-sim runs.")}
+        ${glossEntry("max_dd", "Maximum drawdown — largest % decline from a running peak bankroll within one sim. Headline value is the MEDIAN across sims (the typical experience). The smaller mean number underneath is dragged toward 100% by early-ruin runs.")}
+        ${glossEntry("avg_survival", "Average number of hands the player got through before the run ended. A run can end via ruin, stop-loss, take-profit, or just reaching the planned hand count. For ruin-prone strategies this answers 'how soon does the wheel come off?'.")}
+        ${glossEntry("status_color", "Each row's left border encodes overall status. GREEN: profit chance > 50%, median > start, ruin < 10%. AMBER: mixed signals. RED: ruin ≥ 25% OR median ≤ start OR drawdown ≥ 75%.")}
+      </dl>
+
+      <h2>Reading the charts</h2>
+      <dl class="glossary">
+        ${glossEntry("bankroll_chart", "Median bankroll over hands played, per strategy. The shaded band is the P5–P95 spread (90% confidence band on the trajectory). The dashed gold line marks starting bankroll. Hover for per-strategy values AND 'X/N sims still alive' — when N drops below half, the median is conditioned on survivors only.")}
+        ${glossEntry("survival_chart", "Percent of sims still playing at hand H. A steep early drop reveals strategies that collapse fast (martingale, often). A flat line at 100% means everyone reached the planned hand count.")}
+        ${glossEntry("profit_chart", "Percent of sims with bankroll above start at hand H. The 50% reference line is a useful eye-check: dropping below it means the strategy is failing to recover from losses faster than it adds wins.")}
+        ${glossEntry("outcome_breakdown", "Stacked bar showing how every sim exited: ruined, stop-loss, loss (survived), break-even, profit, take-profit. The bankrupt-to-profit ratio is a single-number safety check — values >> 1 mean the strategy ruins more than it profits.")}
+        ${glossEntry("cum_bankrupt", "Solid line is the % of sims that ended any way other than 'still going' (ruin OR stop-loss) by hand H. Dashed line is ruin only. The vertical gap between them is how often a stop-loss intervention prevented total bankruptcy.")}
+        ${glossEntry("termination_timeline", "One row per sim, sorted by exit hand, color-coded by outcome. Lets you see whether ruins cluster early (a sign of fragile betting) or are scattered (a sign of bad luck swings).")}
+        ${glossEntry("team_chart", "MIT Team's single bankroll line, drawn in Big Player color since BP drives the volatility. Plotted for the run whose final value is closest to the median across sims (not the average curve, which would smooth out the BP swings the strategy is built around). Hover for per-role cumulative P/L breakdown.")}
+        ${glossEntry("sweep", "Hyperparameter sweep — pick one parameter, the engine runs the same strategy across a range of its values while holding everything else at sidebar values. Every point is its own mini Monte Carlo run. Use it for 'how does ruin change as I add decks?' style questions.")}
+        ${glossEntry("pin_run", "Click PIN RUN after a result you want to compare against. Adjust settings, run again, and the prior run appears as a thin dotted overlay on every chart. Click UNPIN to clear. Pinned runs are dropped silently if they used different strategies than the new run.")}
+      </dl>
+
+      <h2>Risk controls</h2>
+      <p>Stop-loss and take-profit gates terminate a sim when bankroll crosses a percentage threshold relative to the starting bankroll. They're useful for evaluating "how would this strategy do if I had any discipline?" — but note that stopping early doesn't change your average outcome much for strategies with negative EV, it just bounds the worst case.</p>
+
+      <h2>Engine notes</h2>
+      <p>The simulator uses a fresh shoe per sim, reshuffles when the cut card is reached (penetration setting), and plays one round per "hand" — splits and doubles produce multi-card hands that still count as a single hand for the purposes of <code>hands_played</code>. Blackjacks pay 3:2 by default (sidebar toggle for 6:5). The Python and JS engines mirror each other; <code>blackjack_sim.py</code> is the reference implementation.</p>
+
+    </div>
+  `;
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // LIVE REPLAY MODE
