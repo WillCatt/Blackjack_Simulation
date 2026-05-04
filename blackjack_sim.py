@@ -357,6 +357,29 @@ class Martingale(BettingStrategy):
         self.consecutive_losses = 0 if won else self.consecutive_losses + 1
 
 
+class DAlembert(BettingStrategy):
+    """Linear chase: +1 unit after a loss, -1 after a win, floor at 1.
+
+    The "gentleman's martingale" — escalation is linear instead of geometric,
+    so 7 losses in a row means betting 8 units rather than 128. The trade-off
+    is much slower recovery: each win only steps the bet down by one unit,
+    not all the way back to the floor.
+    """
+
+    key = "dalembert"
+    name = "D'Alembert"
+
+    def __init__(self, table_min):
+        super().__init__(table_min)
+        self.units = 1   # current bet measured in units of table_min
+
+    def get_bet(self, **kwargs):
+        return self.table_min * self.units
+
+    def update(self, won, net_units, cards_seen=None):
+        self.units = max(1, self.units + (-1 if won else 1))
+
+
 class Paroli(BettingStrategy):
     key = "paroli"
     name = "Paroli"
@@ -530,6 +553,7 @@ class HiLoCheat(BettingStrategy):
 STRATEGY_CLASSES = {
     "flat": FlatBet,
     "martingale": Martingale,
+    "dalembert": DAlembert,
     "paroli": Paroli,
     "oneThreeTwoSix": OneTwoThreeSix,
     "oscar": OscarsGrind,
@@ -541,6 +565,7 @@ STRATEGY_CLASSES = {
 STRATEGY_META = {
     "flat":            {"color": "#4fc3f7", "desc": "Bet the same amount every hand. The control group."},
     "martingale":      {"color": "#ef5350", "desc": "Double after every loss, reset after a win."},
+    "dalembert":       {"color": "#7e57c2", "desc": "After a loss, bet +1 unit. After a win, bet -1 unit. Linear chase, gentler than martingale."},
     "paroli":          {"color": "#66bb6a", "desc": "Double after a win (3-win cap), reset on a loss."},
     "oneThreeTwoSix":  {"color": "#ffa726", "desc": "Bet 1→3→2→6 units on consecutive wins."},
     "oscar":           {"color": "#ab47bc", "desc": "Raise by 1 unit after a win; reset when cycle profits 1 unit."},

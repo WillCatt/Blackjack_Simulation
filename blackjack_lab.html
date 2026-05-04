@@ -745,6 +745,7 @@ function wilson95(successes, total){
 const STRATEGIES = {
   flat:            { name: "Flat Bet",   color: "#4fc3f7", desc: "Bet the same amount every hand. The control group." },
   martingale:      { name: "Martingale", color: "#ef5350", desc: "Double after every loss, reset after a win." },
+  dalembert:       { name: "D'Alembert", color: "#7e57c2", desc: "After a loss, bet +1 unit. After a win, bet -1 unit. Linear chase, gentler than martingale." },
   paroli:          { name: "Paroli",     color: "#66bb6a", desc: "Double after a win (3-win cap), reset on a loss." },
   oneThreeTwoSix:  { name: "1-3-2-6",   color: "#ffa726", desc: "Bet 1→3→2→6 units on consecutive wins." },
   oscar:           { name: "Oscar's Grind", color: "#ab47bc", desc: "Raise by 1 unit after a win; reset when cycle profits 1 unit." },
@@ -772,7 +773,9 @@ let state = {
   // so the user can A/B compare against the current results by eye.
   // Shape: { results: {sKey: summary-only}, label: "6d · 75% pen · …", pinnedAt: ms }
   pinned: null,
-  activeStrategies: new Set(["flat","martingale","hilo"]),
+  // All strategies enabled by default — gives a complete comparison out of
+  // the box. Users can toggle any off in the sidebar.
+  activeStrategies: new Set(Object.keys(STRATEGIES)),
   results: null,
   currentTab: "bankroll",
   liveState: { playing: false, timer: null, speed: 50, handIdx: 0, strategy: "flat" },
@@ -895,6 +898,7 @@ function initBet(key){
   switch(key){
     case "flat": return {};
     case "martingale": return {losses:0};
+    case "dalembert": return {units:1};   // current bet measured in units of table_min
     case "paroli": return {wins:0};
     case "oneThreeTwoSix": return {step:0};
     case "oscar": return {bet:1,profit:0};
@@ -906,6 +910,7 @@ function getBet(key,bs,tmin){
   switch(key){
     case "flat": return tmin;
     case "martingale": return tmin*Math.pow(2,bs.losses);
+    case "dalembert": return tmin*bs.units;   // linear, +1 unit per loss / -1 per win
     case "paroli": return tmin*Math.pow(2,bs.wins);
     case "oneThreeTwoSix": return tmin*[1,3,2,6][bs.step];
     case "oscar": return tmin*bs.bet;
@@ -926,6 +931,7 @@ function updateBet(key,bs,won,allCards){
   switch(key){
     case "flat": return bs;
     case "martingale": return {losses:won?0:bs.losses+1};
+    case "dalembert": return {units: Math.max(1, bs.units + (won ? -1 : 1))};
     case "paroli": {let w=won?Math.min(bs.wins+1,2):0;if(bs.wins>=2&&won)w=0;return {wins:w};}
     case "oneThreeTwoSix": return {step:won?Math.min(bs.step+1,3):0};
     case "oscar": {let nb=bs.bet,np=bs.profit;if(won){np+=bs.bet;nb=bs.bet+1;}else{np-=bs.bet;}if(np>=1)return{bet:1,profit:0};return{bet:Math.max(1,nb),profit:np};}
@@ -2447,6 +2453,12 @@ const SWEEP_PARAMS = {
                  fmt:v=>`$${v}`, apply:v=>{state.settings.tableMin=v;}, restore:v=>{state.settings.tableMin=v;}, current:()=>state.settings.tableMin },
   penetration: { label:"Shoe Penetration",    values:[40,50,60,70,75,80,85,90],
                  fmt:v=>`${v}%`, apply:v=>{state.settings.penetration=v;}, restore:v=>{state.settings.penetration=v;}, current:()=>state.settings.penetration },
+  // Discrete payout sweep — exposes how much the 6:5 vs 3:2 difference
+  // changes outcomes (≈ 1.4% extra house edge in 6:5). Most strategies
+  // shift visibly downward; the cheat strategy survives but with a smaller
+  // margin; martingale's ruin profile barely moves (it's already broken).
+  bjPays:      { label:"Blackjack Payout",    values:["3:2","6:5"],
+                 fmt:v=>v, apply:v=>{state.settings.bjPays=v;}, restore:v=>{state.settings.bjPays=v;}, current:()=>state.settings.bjPays },
 };
 
 const SWEEP_METRICS = [
@@ -2456,9 +2468,10 @@ const SWEEP_METRICS = [
   { key:"ev",            label:"EV per Hand",       unit:"$", color:"#26c6da", fmt:v=>"$"+v.toFixed(2) },
 ];
 
-// Preset combinations focused on shoe characteristics — these change the
-// "background" the sweep is run against. Apply a preset, then sweep any one
-// parameter to see how the strategies behave under those table conditions.
+// Preset combinations. Most change the "background" the sweep runs against
+// (decks/penetration/etc.) and let you sweep any one parameter on top. A few
+// also pre-select WHICH parameter to sweep — most notably the House Edge
+// preset, which is built around the 3:2-vs-6:5 BJ-payout comparison.
 const SWEEP_PRESETS = {
   high_decks_low_pen:  { name:"High Decks · Low Pen",    blurb:"8 decks, 50% pen — hostile shoe game", settings:{decks:8, penetration:50} },
   high_decks_high_pen: { name:"High Decks · High Pen",   blurb:"8 decks, 90% pen — deep shoe, counter-friendly", settings:{decks:8, penetration:90} },
@@ -2466,6 +2479,12 @@ const SWEEP_PRESETS = {
   low_decks_high_pen:  { name:"Low Decks · High Pen",    blurb:"2 decks, 90% pen — counter's paradise", settings:{decks:2, penetration:90} },
   standard_house:      { name:"Standard 6-Deck House",   blurb:"6 decks, 75% pen — Vegas Strip baseline",      settings:{decks:6, penetration:75} },
   pitch_game:          { name:"Heads-up Single Deck",    blurb:"1 deck, 75% pen — old-school pitch game",      settings:{decks:1, penetration:75} },
+  // House-edge preset: standard table, sweep across the BJ payout. Shifting
+  // from 3:2 → 6:5 adds ≈ 1.4% to the house edge, which compounds across
+  // every hand. The shape of the payoff distribution barely moves but
+  // medians and ruin rates shift visibly for every strategy.
+  house_edge:          { name:"House Edge: 3:2 → 6:5",   blurb:"Standard 6-deck table, sweep BJ payout — shows how a single rule change crushes every strategy",
+                          settings:{decks:6, penetration:75}, sweepParam:"bjPays" },
 };
 
 function applySweepPreset(key){
@@ -2476,6 +2495,8 @@ function applySweepPreset(key){
     if(["decks","penetration","tableMin","tableMax","bjPays","dealerS17"].includes(k)) state.settings[k]=p.settings[k];
     if(["bankroll","hands","sims"].includes(k)) state.sim[k]=p.settings[k];
   }
+  // Optional: pre-select WHICH parameter the sweep targets.
+  if(p.sweepParam && SWEEP_PARAMS[p.sweepParam]) state.sweep.param=p.sweepParam;
   // Re-render the sidebar so its inputs reflect the new values, then re-render
   // the sweep panel so the holding-line picks them up.
   if(typeof buildSidebar==="function") buildSidebar();
@@ -2492,7 +2513,7 @@ function buildHoldingLine(){
   if(swept!=="min_bet")      parts.push(`min $${state.settings.tableMin}`);
   if(swept!=="max_bet")      parts.push(`max ${state.settings.tableMax===Infinity?"∞":"$"+state.settings.tableMax.toLocaleString()}`);
   if(swept!=="bankroll")     parts.push(`bankroll ${state.sim.bankroll>=1e8?"~∞":"$"+state.sim.bankroll.toLocaleString()}`);
-  parts.push(`BJ ${state.settings.bjPays}`);
+  if(swept!=="bjPays")       parts.push(`BJ ${state.settings.bjPays}`);
   parts.push(state.settings.dealerS17?"S17":"H17");
   if(state.risk.stopLossPct!=null) parts.push(`SL -${state.risk.stopLossPct}%`);
   if(state.risk.takeProfitPct!=null) parts.push(`TP +${state.risk.takeProfitPct}%`);
@@ -2690,7 +2711,7 @@ function runSweep(){
   // Save originals — sweep mutates state.settings/sim.
   const orig={
     decks:state.settings.decks, tableMin:state.settings.tableMin, tableMax:state.settings.tableMax,
-    penetration:state.settings.penetration,
+    penetration:state.settings.penetration, bjPays:state.settings.bjPays,
     bankroll:state.sim.bankroll, hands:state.sim.hands, sims:state.sim.sims,
   };
 
@@ -2709,6 +2730,7 @@ function runSweep(){
       state.settings.tableMin=orig.tableMin;
       state.settings.tableMax=orig.tableMax;
       state.settings.penetration=orig.penetration;
+      state.settings.bjPays=orig.bjPays;
       state.sim.bankroll=orig.bankroll;
       state.sim.hands=orig.hands;
       state.sim.sims=orig.sims;
@@ -2942,6 +2964,8 @@ const INFO_ENTRIES = {
                      short:"Bet the same amount every hand. The control group — what you'd lose to house edge with no betting system at all." },
   martingale:      { title:"Martingale",
                      short:"Double after every loss; reset after a win. Each cycle ALWAYS recovers losses + 1 unit — until you hit table-max or run out of bankroll. Famously self-destructive." },
+  dalembert:       { title:"D'Alembert",
+                     short:"After a loss, increase the bet by 1 unit. After a win, decrease by 1 unit (floor at 1). Linear chase — gentler than martingale's geometric doubling but still negative EV. Bleeds slowly instead of catastrophically." },
   paroli:          { title:"Paroli (Reverse Martingale)",
                      short:"Double after every WIN, reset after a loss or after 3 wins in a row. Tries to ride streaks; risks little of bankroll but gives back gains quickly." },
   oneThreeTwoSix:  { title:"1-3-2-6 System",
@@ -3056,6 +3080,10 @@ function renderInfo(){
       ${stratCard("martingale",
         "Start at table min. After every loss, double the next bet. After any win, reset to table min. The math says you'll always recover prior losses + 1 unit — the catch is that real tables have a max bet and you have a finite bankroll. After 7–8 consecutive losses (more common than people expect), the next required bet exceeds either the table max or your bankroll, the cycle breaks, and you've banked a catastrophic loss.",
         "Highest ruin rate of any classical system. Heavy-tailed: most sims either eke out small wins or hit a wall and lose everything.")}
+
+      ${stratCard("dalembert",
+        "Start at table min (1 unit). After every loss, raise the next bet by 1 unit. After every win, lower it by 1 unit, floored at 1. The 'gentleman's martingale' — bet escalates linearly rather than geometrically, so 7 losses in a row means betting 8 units, not 128. The trade-off: recovery from a long downswing is much slower because each win only steps the bet down by one, not all the way to the floor.",
+        "Lower ruin than martingale, much higher than flat. A useful 'shape contrast' — you can see negative EV bleeding slowly instead of crashing.")}
 
       ${stratCard("paroli",
         "Inverse of martingale. Bet table min. After every win, double. After 3 wins in a row, reset (lock in the streak gains). After any loss, reset. You only ever risk the original 1-unit stake on each cycle — the rest is house money — but you cap your wins, so you give back gains quickly when streaks die.",
@@ -3598,6 +3626,14 @@ function stopLive(){
 // ══════════════════════════════════════════════════════════════════════════════
 
 function buildSidebar(){
+  // Clear every container we own — buildSidebar can be called repeatedly
+  // (e.g. after applySweepPreset) and would otherwise APPEND duplicate
+  // control rows on each call instead of rebuilding cleanly.
+  for (const id of ["settings-container","sim-settings-container","risk-controls-container","strategies-container"]) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = "";
+  }
+
   const sc=document.getElementById("settings-container");
   const settings=[
     {key:"decks",label:"Decks",min:1,max:8,step:1,fmt:v=>v},
