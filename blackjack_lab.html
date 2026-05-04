@@ -483,6 +483,131 @@
   }
   .info-doc .callout.warn { border-left-color: #ef5350; }
   .info-doc .callout.note { border-left-color: var(--gold); }
+
+  /* ── Guided Tour ─────────────────────────────────────────────────────────
+     The cutout uses the box-shadow trick to dim everything outside its rect:
+     a small element with a 9999px-wide box-shadow paints the surrounding
+     viewport semi-opaque while leaving the rect itself unobscured. */
+  .tour-cutout {
+    position: fixed;
+    box-shadow: 0 0 0 9999px rgba(8, 10, 16, 0.78);
+    border-radius: 6px;
+    pointer-events: none;
+    z-index: 9998;
+    transition: top 0.25s ease, left 0.25s ease, width 0.25s ease, height 0.25s ease;
+    outline: 2px solid var(--gold);
+    outline-offset: 4px;
+  }
+  .tour-cutout.no-target {
+    /* When a step has no target, hide the outline and just dim everything. */
+    box-shadow: 0 0 0 9999px rgba(8, 10, 16, 0.85);
+    outline: none;
+    width: 0; height: 0;
+    top: 50%; left: 50%;
+  }
+  .tour-card {
+    position: fixed;
+    z-index: 9999;
+    width: 340px;
+    background: var(--bg-card);
+    border: 1px solid var(--gold);
+    border-radius: 6px;
+    padding: 18px 20px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    transition: top 0.25s ease, left 0.25s ease;
+  }
+  .tour-card .tour-step {
+    font: 600 10px var(--font-mono);
+    color: var(--gold);
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+  }
+  .tour-card .tour-title {
+    font: 700 16px var(--font-sans);
+    color: var(--text-primary);
+    margin-bottom: 6px;
+  }
+  .tour-card .tour-body {
+    font: 13.5px var(--font-sans);
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin-bottom: 14px;
+  }
+  .tour-card .tour-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .tour-card .tour-controls .spacer { flex: 1; }
+  .tour-card button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    padding: 6px 12px;
+    font: 600 11px var(--font-mono);
+    border-radius: 4px;
+    cursor: pointer;
+    letter-spacing: 0.5px;
+    transition: all 0.12s;
+  }
+  .tour-card button:hover {
+    border-color: var(--gold);
+    color: var(--gold);
+  }
+  .tour-card button.primary {
+    background: var(--gold);
+    color: var(--bg-primary);
+    border-color: var(--gold);
+  }
+  .tour-card button.primary:hover {
+    background: #b8912e;
+    border-color: #b8912e;
+    color: var(--bg-primary);
+  }
+  .tour-card button.skip {
+    color: var(--text-muted);
+    border-color: transparent;
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+
+  /* Landing-page tour-launcher styles */
+  .empty-state .tour-launcher {
+    display: inline-block;
+    margin-top: 18px;
+    padding: 10px 22px;
+    background: linear-gradient(135deg, var(--gold), #b8912e);
+    color: var(--bg-primary);
+    border: none;
+    border-radius: 4px;
+    font: 700 12px var(--font-mono);
+    letter-spacing: 1px;
+    cursor: pointer;
+    transition: transform 0.12s, box-shadow 0.12s;
+  }
+  .empty-state .tour-launcher:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(212,168,67,0.35);
+  }
+  .empty-state .tour-skip {
+    display: block;
+    margin-top: 14px;
+    color: var(--text-muted);
+    font: 11px var(--font-mono);
+  }
+  .empty-state h2 {
+    font: 700 22px var(--font-sans);
+    color: var(--text-primary);
+    margin: 18px 0 8px;
+    letter-spacing: 0.5px;
+  }
+  .empty-state .lede {
+    font: 13.5px var(--font-sans);
+    color: var(--text-secondary);
+    line-height: 1.55;
+    max-width: 460px;
+    margin: 0 auto;
+  }
 </style>
 </head>
 <body>
@@ -528,7 +653,10 @@
   <div class="main" id="main-content">
     <div class="empty-state" id="empty-state">
       <div class="suits">♠ ♥ ♦ ♣</div>
-      <p>Configure settings & hit RUN SIMULATION</p>
+      <h2>Blackjack Strategy Lab</h2>
+      <p class="lede">A Monte Carlo simulator for blackjack betting strategies. Set up a table, pick the systems you want to compare, and play through thousands of hands to see which actually survive.</p>
+      <button class="tour-launcher" onclick="startTour()">Take a 60-second tour</button>
+      <div class="tour-skip">— or configure settings on the left and hit RUN SIMULATION —</div>
     </div>
     <div id="view-bankroll" style="display:none;"></div>
     <div id="view-distribution" style="display:none;"></div>
@@ -2901,6 +3029,7 @@ function renderInfo(){
 
       <h2>About this lab</h2>
       <p>This is a Monte Carlo blackjack simulator. You configure a table (decks, penetration, min/max bet, etc.), pick one or more <b>betting strategies</b>, and the engine plays through thousands of hands across many independent simulations. The tabs above visualize what those sims looked like — bankroll trajectories, survival rates, outcome distributions, statistical summaries, and a hyperparameter sweep tool for "what if I changed this one thing?" experiments.</p>
+      <p><a href="#" onclick="endTour();startTour();return false;" style="color:var(--gold);font:600 11px var(--font-mono);letter-spacing:0.5px;text-decoration:none;border:1px solid var(--gold);padding:6px 14px;border-radius:4px;display:inline-block;">▶ Re-take the 60-second tour</a></p>
       <div class="callout note"><b>One important separation:</b> every strategy in this lab uses the <i>same</i> hit/stand/double/split decisions — textbook basic strategy. The strategies differ purely in how they SIZE their bets. The only exceptions are the count-based ramps (Hi-Lo, Hi-Lo Cheat, MIT) which still play basic strategy on each hand but use the running count to scale up bets when the deck favors the player.</p></div>
 
       <div class="toc-strip">
@@ -2990,6 +3119,246 @@ function renderInfo(){
 
     </div>
   `;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GUIDED TOUR
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Steps point at real DOM elements and dim everything outside their bounding
+// rect (the "cutout" pattern via box-shadow). Steps with no target render the
+// card centered with everything dimmed.
+
+const TOUR_STEPS = [
+  {
+    title: "Welcome to the Lab",
+    body:  "This 60-second tour shows you what each control does. You can hit Skip at any time and explore on your own — every chart and metric is documented in the INFO tab.",
+    target: null,
+  },
+  {
+    title: "1 · Table rules",
+    body:  "Set how the casino is dealing: deck count (1–8), penetration (% of shoe dealt before reshuffle — higher means more counting opportunity), table min/max bet, and the blackjack payout (3:2 player-friendly, 6:5 house-friendly).",
+    target: "#settings-container",
+    position: "right",
+  },
+  {
+    title: "2 · Simulation parameters",
+    body:  "Your starting bankroll, how many hands to play per simulation, and how many independent simulations to run. More sims = tighter confidence intervals on the statistics. 50 sims × 2,000 hands is a sensible starting point.",
+    target: "#sim-settings-container",
+    position: "right",
+  },
+  {
+    title: "3 · Risk controls (optional)",
+    body:  "Stop-loss and take-profit gates that terminate a sim when bankroll crosses a threshold. Useful for asking 'how would this strategy do if I had any discipline?' — leave them off to see worst-case behavior.",
+    target: "#risk-controls-container",
+    position: "right",
+  },
+  {
+    title: "4 · Pick strategies to compare",
+    body:  "Toggle one or more betting strategies — Flat, Martingale, Paroli, Hi-Lo Counting, MIT Team, and others. Their PLAY decisions are identical (basic strategy); they only differ in how they SIZE their bets. Click a row to learn more in the INFO tab.",
+    target: "#strategies-container",
+    position: "right",
+  },
+  {
+    title: "5 · Run the simulation",
+    body:  "Hit RUN SIMULATION and the engine plays your selected strategies through every hand of every sim. Takes a few seconds for a typical 50 × 2,000 run.",
+    target: "#run-btn",
+    position: "bottom-left",
+  },
+  {
+    title: "6 · Reading the results",
+    body:  "Results appear across these tabs — Bankroll trajectories, Distribution of outcomes, Survival curves, Stats summary, MIT Team breakdown, and a Hyperparameter Sweep tool. Each tab has ⓘ icons explaining what its charts mean.",
+    target: ".header-right",
+    position: "bottom",
+  },
+  {
+    title: "7 · INFO tab",
+    body:  "Full reference for every strategy, metric, and chart. The ⓘ icons sprinkled around the lab link back to the relevant section here.",
+    target: "#tab-info",
+    position: "bottom",
+  },
+  {
+    title: "You're set",
+    body:  "Configure on the left, hit RUN SIMULATION, and explore the tabs. After a run, you can also Pin a result and re-run with different settings — the prior run will ghost onto the new charts so you can compare by eye.",
+    target: null,
+  },
+];
+
+function startTour(){
+  state.tour = { active: true, step: 0 };
+  positionTour();
+}
+function endTour(){
+  state.tour = { active: false, step: 0 };
+  const cut = document.getElementById("tour-cutout");
+  const card = document.getElementById("tour-card");
+  if (cut)  cut.remove();
+  if (card) card.remove();
+  // Mark seen so we don't auto-launch on subsequent loads.
+  try { localStorage.setItem("blackjack_lab_tour_seen", "1"); } catch (e) {}
+}
+function nextTourStep(){
+  if (!state.tour || !state.tour.active) return;
+  if (state.tour.step >= TOUR_STEPS.length - 1) { endTour(); return; }
+  state.tour.step++;
+  positionTour();
+}
+function prevTourStep(){
+  if (!state.tour || !state.tour.active) return;
+  if (state.tour.step <= 0) return;
+  state.tour.step--;
+  positionTour();
+}
+
+// Returns true if the element's bounding rect is fully inside the viewport
+// (with a small margin so we don't trigger scrolls for elements that are
+// already comfortably on-screen).
+function isFullyVisible(rect, slackPx){
+  const slack = slackPx == null ? 24 : slackPx;
+  return rect.top    >= slack
+      && rect.left   >= slack
+      && rect.bottom <= window.innerHeight - slack
+      && rect.right  <= window.innerWidth  - slack;
+}
+
+function positionTour(){
+  if (!state.tour || !state.tour.active) return;
+  const step = TOUR_STEPS[state.tour.step];
+  const target = step.target ? document.querySelector(step.target) : null;
+
+  // If the target is offscreen (or partially clipped), scroll it into view
+  // FIRST and then re-measure once the smooth-scroll has settled. We still
+  // place once immediately so the card doesn't disappear during the 300ms
+  // animation; the second placement snaps it onto the final position.
+  if (target) {
+    const initialRect = target.getBoundingClientRect();
+    if (!isFullyVisible(initialRect)) {
+      target.scrollIntoView({behavior: "smooth", block: "center", inline: "nearest"});
+      // First placement: position relative to where the target IS right now.
+      _placeTourElements(step, target);
+      // Second placement: after smooth-scroll settles. Guard against the
+      // tour having been dismissed mid-scroll.
+      setTimeout(() => {
+        if (!state.tour || !state.tour.active) return;
+        if (TOUR_STEPS[state.tour.step] !== step) return; // user advanced past this step
+        _placeTourElements(step, target);
+      }, 320);
+      return;
+    }
+  }
+  _placeTourElements(step, target);
+}
+
+// Pure layout — assumes any required scrolling has already started/finished.
+function _placeTourElements(step, target){
+  // Build / reuse cutout + card elements.
+  let cutout = document.getElementById("tour-cutout");
+  if (!cutout) {
+    cutout = document.createElement("div");
+    cutout.id = "tour-cutout";
+    cutout.className = "tour-cutout";
+    document.body.appendChild(cutout);
+  }
+  let card = document.getElementById("tour-card");
+  if (!card) {
+    card = document.createElement("div");
+    card.id = "tour-card";
+    card.className = "tour-card";
+    document.body.appendChild(card);
+  }
+
+  // Position the cutout over the target (or hide it for centered steps).
+  let targetRect = null;
+  if (target) {
+    cutout.classList.remove("no-target");
+    targetRect = target.getBoundingClientRect();
+    const pad = 6;
+    cutout.style.top    = (targetRect.top    - pad) + "px";
+    cutout.style.left   = (targetRect.left   - pad) + "px";
+    cutout.style.width  = (targetRect.width  + pad*2) + "px";
+    cutout.style.height = (targetRect.height + pad*2) + "px";
+  } else {
+    cutout.classList.add("no-target");
+  }
+
+  // Step body.
+  const isLast  = state.tour.step >= TOUR_STEPS.length - 1;
+  const isFirst = state.tour.step === 0;
+  card.innerHTML = `
+    <div class="tour-step">STEP ${state.tour.step + 1} OF ${TOUR_STEPS.length}</div>
+    <div class="tour-title">${step.title}</div>
+    <div class="tour-body">${step.body}</div>
+    <div class="tour-controls">
+      <button class="skip" onclick="endTour()">Skip tour</button>
+      <div class="spacer"></div>
+      ${isFirst ? "" : `<button onclick="prevTourStep()">Back</button>`}
+      <button class="primary" onclick="nextTourStep()">${isLast ? "Done" : "Next →"}</button>
+    </div>
+  `;
+
+  // Position the card. We measure AFTER setting innerHTML so we know its size.
+  // Default: centered when no target.
+  const margin = 16;
+  const cardRect = card.getBoundingClientRect();
+  let top, left;
+  if (!targetRect) {
+    top  = (window.innerHeight - cardRect.height) / 2;
+    left = (window.innerWidth  - cardRect.width)  / 2;
+  } else {
+    const pos = step.position || "right";
+    if (pos === "right") {
+      top  = targetRect.top;
+      left = targetRect.right + margin;
+    } else if (pos === "left") {
+      top  = targetRect.top;
+      left = targetRect.left - cardRect.width - margin;
+    } else if (pos === "bottom") {
+      top  = targetRect.bottom + margin;
+      left = targetRect.left;
+    } else if (pos === "bottom-left") {
+      top  = targetRect.bottom + margin;
+      left = targetRect.right - cardRect.width;
+    } else if (pos === "top") {
+      top  = targetRect.top - cardRect.height - margin;
+      left = targetRect.left;
+    } else {
+      top  = targetRect.top;
+      left = targetRect.right + margin;
+    }
+    // Clamp to viewport.
+    const maxLeft = window.innerWidth  - cardRect.width  - 8;
+    const maxTop  = window.innerHeight - cardRect.height - 8;
+    left = Math.max(8, Math.min(maxLeft, left));
+    top  = Math.max(8, Math.min(maxTop,  top));
+  }
+  card.style.top  = top  + "px";
+  card.style.left = left + "px";
+}
+
+// Re-flow the tour on resize so cutout and card stay glued to the target.
+window.addEventListener("resize", () => {
+  if (state && state.tour && state.tour.active) positionTour();
+});
+
+// Auto-launch the tour on first visit. Wrapped in a try because localStorage
+// can throw in strict sandbox / file:// contexts. The deferred callback
+// re-checks the flag and the user's current state — if they've already
+// interacted with the lab in the intervening 250ms, we don't pop the tour
+// over them.
+function maybeAutoStartTour(){
+  try {
+    if (localStorage.getItem("blackjack_lab_tour_seen") === "1") return;
+    setTimeout(() => {
+      // Re-check at fire time — flag may have been set, or user may have
+      // already started the tour or run a sim during the delay.
+      try {
+        if (localStorage.getItem("blackjack_lab_tour_seen") === "1") return;
+      } catch (e) {}
+      if (state.tour && state.tour.active) return;
+      if (state.results) return;
+      startTour();
+    }, 250);
+  } catch (e) { /* localStorage unavailable — skip auto-start */ }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3388,6 +3757,7 @@ function buildSidebar(){
 }
 
 buildSidebar();
+maybeAutoStartTour();
 </script>
 </body>
 </html>
