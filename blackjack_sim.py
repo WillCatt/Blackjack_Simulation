@@ -476,6 +476,60 @@ class HiLoCount(BettingStrategy):
         self.running_count = 0
 
 
+class KellyCount(BettingStrategy):
+    """Kelly Criterion sizing on the Hi-Lo true count.
+
+    The mathematically optimal bet sizing for a known edge:
+
+        bet = bankroll × edge / variance
+
+    For blackjack with Hi-Lo, we approximate edge as 0.5% per true-count point
+    above 1 (a standard counting heuristic) and divide by ~1.3 (BJ variance
+    per unit bet). Floor at table_min so the player can stay seated, cap at
+    table_max and at current bankroll — Kelly never risks more than you have.
+
+    Setting `kelly_fraction` to 0.5 gives the Half-Kelly variant: roughly
+    25% less long-run growth in exchange for ~50% less variance, which is
+    overwhelmingly favorable for any human who has to live through the swings.
+    """
+
+    key = "kelly"
+    name = "Kelly (Hi-Lo)"
+    kelly_fraction = 1.0
+
+    def __init__(self, table_min):
+        super().__init__(table_min)
+        self.running_count = 0
+        self._decks_remaining = 4.0
+
+    def get_bet(self, decks_remaining: float = 4.0,
+                bankroll: float = 0.0, table_max: float = float("inf"),
+                **kwargs):
+        self._decks_remaining = max(0.5, decks_remaining)
+        tc = self.running_count / self._decks_remaining
+        advantage = max(0.0, (tc - 1.0) * 0.005)   # 0.5% per TC over 1
+        raw = self.kelly_fraction * bankroll * advantage / 1.3
+        # Cap at min(table_max, bankroll) so the strategy never tries to bet
+        # more than the player has.
+        cap = min(table_max, bankroll) if bankroll > 0 else table_max
+        return max(self.table_min, min(raw, cap))
+
+    def update(self, won, net_units, cards_seen=None):
+        if cards_seen:
+            for card in cards_seen:
+                self.running_count += HILO_COUNT.get(card, 0)
+
+    def on_reshuffle(self):
+        self.running_count = 0
+
+
+class HalfKelly(KellyCount):
+    """Half-Kelly variant — see KellyCount for full notes."""
+    key = "half_kelly"
+    name = "Half Kelly"
+    kelly_fraction = 0.5
+
+
 class HiLoCheat(BettingStrategy):
     """
     'Cheating' Hi-Lo counter.
@@ -558,6 +612,8 @@ STRATEGY_CLASSES = {
     "oneThreeTwoSix": OneTwoThreeSix,
     "oscar": OscarsGrind,
     "hilo": HiLoCount,
+    "kelly": KellyCount,
+    "half_kelly": HalfKelly,
     "hilo_cheat": HiLoCheat,
     "mit_team": None,   # MIT team uses a custom multi-actor runner; see run_mit_team_sim
 }
@@ -570,6 +626,8 @@ STRATEGY_META = {
     "oneThreeTwoSix":  {"color": "#ffa726", "desc": "Bet 1→3→2→6 units on consecutive wins."},
     "oscar":           {"color": "#ab47bc", "desc": "Raise by 1 unit after a win; reset when cycle profits 1 unit."},
     "hilo":            {"color": "#26c6da", "desc": "Bet proportional to the Hi-Lo true count."},
+    "kelly":           {"color": "#00897b", "desc": "Mathematically optimal sizing: bet ≈ bankroll × edge / variance. Maximises long-run growth."},
+    "half_kelly":      {"color": "#80cbc4", "desc": "Half of Kelly — ~25% less growth, ~50% less variance. The practical compromise."},
     "hilo_cheat":      {"color": "#ffd54f", "desc": "Oracle player — peeks hole card, perfect index plays, ultra-aggressive ramp."},
     "mit_team":        {"color": "#e040fb", "desc": "MIT-style 3-person team: Spotter counts, Big Player swoops on hot shoes."},
 }
@@ -968,7 +1026,13 @@ def run_single_sim(
             strategy.attach_shoe(shoe)
 
         # Determine the bet the strategy *wants* to place this round.
-        raw_bet = strategy.get_bet(decks_remaining=shoe.decks_remaining)
+        # bankroll + table_max are only consumed by Kelly variants; other
+        # strategies ignore them via **kwargs.
+        raw_bet = strategy.get_bet(
+            decks_remaining=shoe.decks_remaining,
+            bankroll=bankroll,
+            table_max=config.table_max,
+        )
         # Floor at the table min (you can't bet less than the minimum).
         next_required_bet = max(raw_bet, config.table_min)
 

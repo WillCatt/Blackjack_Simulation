@@ -624,6 +624,7 @@
     <button class="btn" id="tab-stats" onclick="switchTab('stats')">STATS</button>
     <button class="btn" id="tab-team" onclick="switchTab('team')">MIT TEAM</button>
     <button class="btn" id="tab-sweep" onclick="switchTab('sweep')">SWEEP</button>
+    <button class="btn" id="tab-scenarios" onclick="switchTab('scenarios')">SCENARIOS</button>
     <button class="btn" id="tab-live" onclick="switchTab('live')">LIVE</button>
     <button class="btn" id="tab-info" onclick="switchTab('info')">INFO</button>
     <button class="btn" id="pin-btn" onclick="togglePin()" title="Snapshot current results — they ghost onto the next run's charts so you can A/B by eye. Click the i in the INFO tab for full detail." style="display:none">PIN RUN</button>
@@ -664,6 +665,7 @@
     <div id="view-stats" style="display:none;"></div>
     <div id="view-team" style="display:none;"></div>
     <div id="view-sweep" style="display:none;"></div>
+    <div id="view-scenarios" style="display:none;"></div>
     <div id="view-live" style="display:none;"></div>
     <div id="view-info" style="display:none;"></div>
   </div>
@@ -750,6 +752,8 @@ const STRATEGIES = {
   oneThreeTwoSix:  { name: "1-3-2-6",   color: "#ffa726", desc: "Bet 1→3→2→6 units on consecutive wins." },
   oscar:           { name: "Oscar's Grind", color: "#ab47bc", desc: "Raise by 1 unit after a win; reset when cycle profits 1 unit." },
   hilo:            { name: "Hi-Lo Count",   color: "#26c6da", desc: "Bet proportional to the Hi-Lo true count." },
+  kelly:           { name: "Kelly (Hi-Lo)", color: "#00897b", desc: "Mathematically optimal sizing: bet ≈ bankroll × edge / variance. Maximises long-run growth rate." },
+  half_kelly:      { name: "Half Kelly",    color: "#80cbc4", desc: "Half of Kelly — sacrifices growth for ¼ the variance. The practical compromise most counters actually use." },
   hilo_cheat:      { name: "Hi-Lo (Cheating)", color: "#ffd54f", desc: "Same play as Hi-Lo, but knows the EXACT true count at all times — bets on a much steeper ramp." },
   mit_team:        { name: "MIT Team", color: "#e040fb", desc: "3-person team: Spotter counts, Controller verifies, Big Player swoops on hot shoes." },
 };
@@ -776,6 +780,11 @@ let state = {
   // All strategies enabled by default — gives a complete comparison out of
   // the box. Users can toggle any off in the sidebar.
   activeStrategies: new Set(Object.keys(STRATEGIES)),
+  // Bankroll chart view mode: "band" (median + P5/P95 ribbon) or "heatmap"
+  // (density of all paths passing through each [hand, $] cell — reveals
+  // bimodal distributions like martingale's recovered-vs-ruined split).
+  bankrollView: "band",
+  bankrollHeatmapStrategy: null,   // which strategy's heatmap to display
   results: null,
   currentTab: "bankroll",
   liveState: { playing: false, timer: null, speed: 50, handIdx: 0, strategy: "flat" },
@@ -821,7 +830,42 @@ function shoeDeal(shoe){return shoe.cards[shoe.idx++];}
 function shoeNeedsReshuffle(shoe){return shoe.idx>=shoe.cut;}
 function shoeDecksRemaining(shoe){return Math.max(0.5,(shoe.cards.length-shoe.idx)/52);}
 
-function basicStrategy(cards, dealerUp, canDouble, canSplit){
+// ── Illustrious 18 deviations ──
+// Count-based play deviations from basic strategy. A real card counter
+// doesn't just vary BET size — they also deviate on a handful of close
+// play decisions when the true count is sufficiently positive or negative.
+// We implement the top 8 hard-hand deviations (the ones with the highest
+// EV contribution). Soft hands and pair splits are unchanged. Insurance
+// isn't modeled in this engine.
+//
+// Each entry is [playerTotal, dealerUp, tcThreshold, deviationAction].
+// "stand_above" means: stand if trueCount ≥ threshold (basic says hit).
+// "double_above" means: double if trueCount ≥ threshold AND can double.
+const HILO_DEVIATIONS = [
+  // [pt, dv, tc, kind]
+  [16, 10, 0,    "stand_above"],   // The single most-played deviation
+  [15, 10, 4,    "stand_above"],
+  [12,  3, 2,    "stand_above"],
+  [12,  2, 3,    "stand_above"],
+  [11, 11, 1,    "double_above"],  // 11 vs A (dealerVal=11)
+  [10, 10, 4,    "double_above"],
+  [10, 11, 4,    "double_above"],  // 10 vs A
+  [ 9,  2, 1,    "double_above"],
+  [ 9,  7, 3,    "double_above"],
+];
+
+function applyDeviation(action, pt, dv, canDouble, trueCount){
+  if (trueCount == null) return action;
+  for (const [dpt, ddv, tc, kind] of HILO_DEVIATIONS) {
+    if (dpt !== pt || ddv !== dv) continue;
+    if (kind === "stand_above" && trueCount >= tc && action === "hit") return "stand";
+    if (kind === "double_above" && trueCount >= tc && canDouble && action === "hit") return "double";
+  }
+  return action;
+}
+
+function basicStrategy(cards, dealerUp, canDouble, canSplit, trueCount){
+  if (trueCount === undefined) trueCount = null;
   const pt=handTotal(cards),dv=cardVal(dealerUp),soft=isSoft(cards);
   if(canSplit&&cards.length===2&&cards[0]===cards[1]){
     const pv=cardVal(cards[0]);
@@ -840,23 +884,28 @@ function basicStrategy(cards, dealerUp, canDouble, canSplit){
     if((pt===13||pt===14)&&dv>=5&&dv<=6&&canDouble) return "double";
     return "hit";
   }
-  if(pt>=17) return "stand";
-  if(pt>=13&&pt<=16&&dv>=2&&dv<=6) return "stand";
-  if(pt===12&&dv>=4&&dv<=6) return "stand";
-  if(pt===11&&canDouble) return "double";
-  if(pt===10&&dv<=9&&canDouble) return "double";
-  if(pt===9&&dv>=3&&dv<=6&&canDouble) return "double";
-  return "hit";
+  // Hard-hand baseline.
+  let action;
+  if(pt>=17) action="stand";
+  else if(pt>=13&&pt<=16&&dv>=2&&dv<=6) action="stand";
+  else if(pt===12&&dv>=4&&dv<=6) action="stand";
+  else if(pt===11&&canDouble) action="double";
+  else if(pt===10&&dv<=9&&canDouble) action="double";
+  else if(pt===9&&dv>=3&&dv<=6&&canDouble) action="double";
+  else action="hit";
+  // Apply count-based deviation if a true count was supplied.
+  return applyDeviation(action, pt, dv, canDouble, trueCount);
 }
 
-function playHand(shoe){
+function playHand(shoe, trueCount){
+  if (trueCount === undefined) trueCount = null;
   const p=[shoeDeal(shoe),shoeDeal(shoe)], d=[shoeDeal(shoe),shoeDeal(shoe)];
   const allCards=[...p,...d], dealerUp=d[0];
   let pt=handTotal(p),dt=handTotal(d);
   if(pt===21){return {net:dt===21?0:1.5,pCards:[...p],dCards:[...d],pt,dt,bj:dt!==21,allCards};}
   if(dt===21){return {net:-1,pCards:[...p],dCards:[...d],pt,dt,bj:false,allCards};}
   function playP(cards,canSplit){
-    let action=basicStrategy(cards,dealerUp,cards.length===2,canSplit);
+    let action=basicStrategy(cards,dealerUp,cards.length===2,canSplit,trueCount);
     if(action==="split"&&canSplit){
       const h1=[cards[0],shoeDeal(shoe)],h2=[cards[1],shoeDeal(shoe)];
       allCards.push(h1[1],h2[1]);
@@ -864,7 +913,7 @@ function playHand(shoe){
     }
     let doubled=false;
     while(true){
-      action=basicStrategy(cards,dealerUp,cards.length===2&&!doubled,false);
+      action=basicStrategy(cards,dealerUp,cards.length===2&&!doubled,false,trueCount);
       if(action==="stand") break;
       if(action==="double"){const c=shoeDeal(shoe);cards.push(c);allCards.push(c);doubled=true;break;}
       const c=shoeDeal(shoe);cards.push(c);allCards.push(c);
@@ -894,6 +943,20 @@ function exactRunningCount(shoe){
 }
 
 // ── Betting strategy state machines ──
+// Kelly Criterion: bet ≈ bankroll × edge / variance. We approximate the
+// player edge as 0.5% per true-count point above 1 (a standard counting
+// heuristic), and divide by ≈1.3 (blackjack variance per unit bet).
+//   full_kelly_units = bankroll × max(0, TC-1) × 0.005 / 1.3
+// Floor at table min (you have to bet *something* to stay seated), cap at
+// table max and at current bankroll (Kelly never risks more than you have).
+function _kellyBet(bs, tmin, ctx, fraction){
+  const tc  = bs.rc / Math.max(1, bs._dr||4);
+  const adv = Math.max(0, (tc - 1) * 0.005);   // 0.5% edge per TC over 1
+  const raw = fraction * (ctx?.bankroll||0) * adv / 1.3;
+  const cap = Math.min(ctx?.tableMax||Infinity, ctx?.bankroll||Infinity);
+  return Math.max(tmin, Math.min(raw, cap));
+}
+
 function initBet(key){
   switch(key){
     case "flat": return {};
@@ -903,10 +966,14 @@ function initBet(key){
     case "oneThreeTwoSix": return {step:0};
     case "oscar": return {bet:1,profit:0};
     case "hilo": return {rc:0};
+    case "kelly": return {rc:0};
+    case "half_kelly": return {rc:0};
     case "hilo_cheat": return {rc:0};
   }
 }
-function getBet(key,bs,tmin){
+// ctx carries {bankroll, tableMax} — only Kelly variants read it, but the
+// signature is uniform so simulate() doesn't need a switch at the call site.
+function getBet(key,bs,tmin,ctx){
   switch(key){
     case "flat": return tmin;
     case "martingale": return tmin*Math.pow(2,bs.losses);
@@ -915,6 +982,8 @@ function getBet(key,bs,tmin){
     case "oneThreeTwoSix": return tmin*[1,3,2,6][bs.step];
     case "oscar": return tmin*bs.bet;
     case "hilo": {const tc=bs.rc/Math.max(1,bs._dr||4);if(tc<=1)return tmin;if(tc<=2)return tmin*2;if(tc<=3)return tmin*4;if(tc<=4)return tmin*8;return tmin*12;}
+    case "kelly":      return _kellyBet(bs, tmin, ctx, 1.0);
+    case "half_kelly": return _kellyBet(bs, tmin, ctx, 0.5);
     case "hilo_cheat": {
       // Aggressive ramp — the cheater knows EV.
       const tc=bs.rc/Math.max(1,bs._dr||4);
@@ -936,7 +1005,9 @@ function updateBet(key,bs,won,allCards){
     case "oneThreeTwoSix": return {step:won?Math.min(bs.step+1,3):0};
     case "oscar": {let nb=bs.bet,np=bs.profit;if(won){np+=bs.bet;nb=bs.bet+1;}else{np-=bs.bet;}if(np>=1)return{bet:1,profit:0};return{bet:Math.max(1,nb),profit:np};}
     case "hilo":
-    case "hilo_cheat": {let rc=bs.rc;if(allCards) for(const c of allCards) rc+=(HILO_TAGS[c]||0);return{rc};}
+    case "hilo_cheat":
+    case "kelly":
+    case "half_kelly": {let rc=bs.rc;if(allCards) for(const c of allCards) rc+=(HILO_TAGS[c]||0);return{rc};}
   }
 }
 
@@ -951,9 +1022,10 @@ function simulate(sKey, recordHands){
   const tpThreshold=(takeProfitPct!=null && takeProfitPct>0) ? startB*(1 + takeProfitPct/100) : null;
   let shoe=createShoe(decks), bankroll=startB, maxB=startB, maxDD=0;
   let ruined=false, stoppedLoss=false, stoppedProfit=false, handsPlayed=0;
+  let totalWagered=0;            // ROI/Return-on-Risk denominator
   let bs=initBet(sKey);
   const bjMult=bjPays==="3:2"?1.5:1.2;
-  const isCount=(sKey==="hilo"||sKey==="hilo_cheat");
+  const isCount=(sKey==="hilo"||sKey==="hilo_cheat"||sKey==="kelly"||sKey==="half_kelly");
   const isCheat=(sKey==="hilo_cheat");
   const sampleInterval=Math.max(1,Math.floor(numH/800));
   const history=[{hand:0,bankroll}];
@@ -965,7 +1037,7 @@ function simulate(sKey, recordHands){
     if(shoe.cards.length-shoe.idx<15){shoe=createShoe(decks);if(isCount)bs={rc:0};}
     if(isCount) bs._dr=shoeDecksRemaining(shoe);
     if(isCheat) bs.rc=exactRunningCount(shoe);
-    let rawBet=getBet(sKey,bs,tableMin);
+    let rawBet=getBet(sKey,bs,tableMin,{bankroll, tableMax});
     // What the strategy *requires* this round, floored at the table min.
     const nextRequiredBet=Math.max(rawBet, tableMin);
 
@@ -978,8 +1050,15 @@ function simulate(sKey, recordHands){
     if(tpThreshold!==null && bankroll >= tpThreshold){ stoppedProfit=true; break; }
 
     const bet=nextRequiredBet;  // guards passed
-    const r=playHand(shoe);
+    // Counters get the Illustrious 18 play deviations: if we're a counting
+    // strategy, pass the current true count into playHand so basicStrategy
+    // can switch hit↔stand and hit↔double on the high-EV deviation hands.
+    const tcForPlay = isCount ? (bs.rc / Math.max(1, bs._dr || shoeDecksRemaining(shoe))) : null;
+    const r=playHand(shoe, tcForPlay);
     handsPlayed++;
+    totalWagered += bet;     // doubles add another bet in playHand but we
+                             // approximate exposure as the initial bet — this
+                             // matches how casino comps measure "action".
     const payout=r.bj&&r.net>0?bet*bjMult:r.net*bet;
     bankroll=Math.round((bankroll+payout)*100)/100;
     maxB=Math.max(maxB,bankroll);
@@ -1004,6 +1083,7 @@ function simulate(sKey, recordHands){
   const total=wins+losses+pushes+bjs;
   return {history,hands,final_bankroll:bankroll,max_drawdown:Math.round(maxDD*1e4)/1e4,
     ruined, stopped_loss:stoppedLoss, stopped_profit:stoppedProfit, hands_played:handsPlayed,
+    total_wagered:Math.round(totalWagered*100)/100,
     stats:{total_hands:total,wins,losses,pushes,blackjacks:bjs,win_rate:Math.round((wins+bjs)/Math.max(total,1)*1e4)/1e4}};
 }
 
@@ -1037,10 +1117,12 @@ function simulateMitTeam(recordHands){
 
   let bpW=0,bpL=0,bpP=0,bpBJ=0,bpDoubles=0,bpHandsPlayed=0;
   let spotW=0,spotL=0,ctrlW=0,ctrlL=0;
+  let totalWagered=0;            // sum of every role's bet, for ROR
 
   function safeReshuffle(){ shoe=createShoe(decks); runningCount=0; }
   function resolve(role, bet){
     if(shoeNeedsReshuffle(shoe) || (shoe.cards.length-shoe.idx)<15) safeReshuffle();
+    totalWagered += bet;
     const r=playHand(shoe);
     for(const c of r.allCards) runningCount+=(HILO_TAGS[c]||0);
     const payout=r.bj && r.net>0 ? bet*bjMult : r.net*bet;
@@ -1167,6 +1249,7 @@ function simulateMitTeam(recordHands){
   return {
     history, hands,
     final_bankroll: Math.round(bankroll*100)/100,
+    total_wagered: Math.round(totalWagered*100)/100,
     // team_breakdown now contains per-role CUMULATIVE P/L contributions, not slices.
     team_breakdown: {
       spotter: Math.round(rolePL.spotter*100)/100,
@@ -1221,6 +1304,12 @@ function runSimulation(){
       const profitChance=sims.filter(s=>s.final_bankroll>startB).length/n;
       const totalProfit=finals.reduce((a,f)=>a+(f-startB),0);
       const totalHandsPlayed=sims.reduce((a,s)=>a+Math.max(s.hands_played||numH,1),0);
+      // Return on Risk = total profit / total dollars wagered. Normalizes
+      // for exposure so strategies that bet wildly more capital (martingale,
+      // hilo, kelly) are comparable to flat. ROR of -0.01 means you lost
+      // 1 cent on every dollar you put through the table.
+      const totalWageredAll = sims.reduce((a,s)=>a+(s.total_wagered||0), 0);
+      const returnOnRisk = totalWageredAll > 0 ? totalProfit / totalWageredAll : 0;
       // EV/Hand divides by INTENDED hands (n × numH), not played hands.
       // Otherwise a martingale that ruins at hand 5 with -$5,000 gets divided
       // by ~5 instead of ~2,000, producing a misleadingly large per-hand
@@ -1278,6 +1367,9 @@ function runSimulation(){
           p25:Math.round(pctOf(brs,0.25)*100)/100,
           p75:Math.round(pctOf(brs,0.75)*100)/100,
           p95:Math.round(pctOf(brs,0.95)*100)/100,
+          // Raw sorted bankrolls per sim at this hand — drives the density
+          // heatmap view (alternative to median/band rendering).
+          brs: brs.slice(),
         });
       }
 
@@ -1321,6 +1413,8 @@ function runSimulation(){
         profit_chance_pct:Math.round(profitChance*1e4)/100,
         ev_per_hand:Math.round(evPerHand*1e4)/1e4,
         ev_per_played_hand:Math.round(evPerPlayedHand*1e4)/1e4,
+        return_on_risk: Math.round(returnOnRisk*1e6)/1e6,
+        avg_total_wagered: Math.round(totalWageredAll/Math.max(n,1)*100)/100,
         median_profit:Math.round((median-startB)*100)/100,
         avg_hands_lasted:Math.round(avgHandsLasted*10)/10,
         median_hands_lasted:Math.round(medianHandsLasted),
@@ -1448,21 +1542,22 @@ function updatePinButton(){
 
 function switchTab(tab){
   state.currentTab=tab;
-  // Sweep and Info can render even before the main simulation has run —
-  // Sweep does its own runs, Info is static reference content.
-  ["bankroll","distribution","survival","stats","team","sweep","live","info"].forEach(t=>{
+  // Sweep, Scenarios, and Info can render even before the main simulation
+  // has run — they don't read state.results.
+  ["bankroll","distribution","survival","stats","team","sweep","scenarios","live","info"].forEach(t=>{
     document.getElementById(`tab-${t}`).classList.toggle("active",t===tab);
-    const showAlways=(t==="sweep"||t==="info");
+    const showAlways=(t==="sweep"||t==="scenarios"||t==="info");
     document.getElementById(`view-${t}`).style.display=t===tab && (state.results||showAlways)?"block":"none";
   });
   if(tab!=="live") stopLive();
   if(tab==="sweep") { renderSweep(); document.getElementById("empty-state").style.display="none"; }
+  else if(tab==="scenarios") { renderScenarios(); document.getElementById("empty-state").style.display="none"; }
   else if(tab==="info") { renderInfo(); document.getElementById("empty-state").style.display="none"; }
   else if(state.results) renderCurrentTab();
-  // Pin doesn't apply to Sweep or Info (no overlay), so hide on those tabs.
+  // Pin doesn't apply to Sweep/Scenarios/Info (no overlay), so hide on those tabs.
   const pinBtn=document.getElementById("pin-btn");
   if(pinBtn){
-    if(tab==="sweep"||tab==="info") pinBtn.style.display="none";
+    if(tab==="sweep"||tab==="scenarios"||tab==="info") pinBtn.style.display="none";
     else updatePinButton();
   }
 }
@@ -1492,8 +1587,51 @@ function renderBankroll(){
 
   const headerEl=document.createElement("div");
   headerEl.className="chart-header";
-  headerEl.innerHTML=`<span class="chart-label">BANKROLL OVER TIME${infoIcon("bankroll_chart")}</span><span class="chart-label">${state.sim.sims>1?"MEDIAN + P5/P95 BAND":"SINGLE RUN"}</span>`;
+  const subLabel = state.sim.sims<=1 ? "SINGLE RUN"
+                   : (state.bankrollView==="heatmap" ? "DENSITY HEATMAP" : "MEDIAN + P5/P95 BAND");
+  headerEl.innerHTML=`<span class="chart-label">BANKROLL OVER TIME${infoIcon("bankroll_chart")}</span><span class="chart-label">${subLabel}</span>`;
   wrap.appendChild(headerEl);
+
+  // ── View-mode toggle (only meaningful with multi-sim runs) ──
+  if (state.sim.sims > 1) {
+    const toggleRow = document.createElement("div");
+    toggleRow.style.cssText = "display:flex;gap:6px;align-items:center;margin:6px 0 8px;font:11px var(--font-mono);";
+    toggleRow.innerHTML = `<span style="color:var(--text-muted);letter-spacing:0.5px;margin-right:4px;">VIEW:</span>`;
+    for (const m of [{k:"band", l:"Band"}, {k:"heatmap", l:"Heatmap"}]) {
+      const b = document.createElement("button");
+      const isActive = state.bankrollView === m.k;
+      b.style.cssText = `padding:4px 10px;background:${isActive?'var(--gold-dim)':'transparent'};border:1px solid ${isActive?'var(--gold)':'var(--border)'};color:${isActive?'var(--gold)':'var(--text-secondary)'};font:11px var(--font-mono);border-radius:3px;cursor:pointer;letter-spacing:0.3px;`;
+      b.textContent = m.l;
+      b.onclick = () => { state.bankrollView = m.k; renderBankroll(); };
+      toggleRow.appendChild(b);
+    }
+    // In heatmap mode with >1 active strategy, show a small strategy picker.
+    if (state.bankrollView === "heatmap" && state.activeStrategies.size > 1) {
+      const sep = document.createElement("span");
+      sep.style.cssText = "color:var(--text-muted);margin:0 6px;";
+      sep.textContent = "·";
+      toggleRow.appendChild(sep);
+      const lbl = document.createElement("span");
+      lbl.style.cssText = "color:var(--text-muted);letter-spacing:0.5px;margin-right:4px;";
+      lbl.textContent = "STRATEGY:";
+      toggleRow.appendChild(lbl);
+      const sel = document.createElement("select");
+      sel.style.cssText = "padding:3px 6px;background:var(--bg-elevated);border:1px solid var(--border);color:var(--text-primary);font:11px var(--font-mono);border-radius:3px;";
+      const activeKeys = [...state.activeStrategies];
+      if (!state.bankrollHeatmapStrategy || !state.activeStrategies.has(state.bankrollHeatmapStrategy)) {
+        state.bankrollHeatmapStrategy = activeKeys[0];
+      }
+      for (const sk of activeKeys) {
+        const opt = document.createElement("option");
+        opt.value = sk; opt.textContent = STRATEGIES[sk].name;
+        if (sk === state.bankrollHeatmapStrategy) opt.selected = true;
+        sel.appendChild(opt);
+      }
+      sel.onchange = () => { state.bankrollHeatmapStrategy = sel.value; renderBankroll(); };
+      toggleRow.appendChild(sel);
+    }
+    wrap.appendChild(toggleRow);
+  }
 
   const margin={top:20,right:30,bottom:40,left:65};
   const width=wrap.clientWidth-margin.left-margin.right-40;
@@ -1532,19 +1670,84 @@ function renderBankroll(){
     .attr("y1",y(state.sim.bankroll)).attr("y2",y(state.sim.bankroll))
     .attr("stroke","#d4a843").attr("stroke-dasharray","6,4").attr("stroke-width",1).attr("opacity",0.45);
 
-  // Bands + median lines
-  for(const sKey of keys){
-    const col=STRATEGIES[sKey].color;
-    const c=state.results[sKey].summary.curves;
-    if(state.sim.sims>1){
-      const area=d3.area().x(d=>x(d.hand)).y0(d=>y(d.p5)).y1(d=>y(d.p95)).curve(d3.curveMonotoneX);
-      svg.append("path").datum(c).attr("d",area).attr("fill",col).attr("opacity",0.12);
+  // ── Heatmap mode (single strategy at a time): bin every sim's path into
+  // [hand_bin][bankroll_bin] cells, color by cell count. Shows bimodality
+  // and density distribution that bands hide.
+  if (state.bankrollView === "heatmap" && state.sim.sims > 1) {
+    const sKey = state.bankrollHeatmapStrategy || keys[0];
+    const c = state.results[sKey]?.summary?.curves;
+    if (c && c.length > 1) {
+      const col = STRATEGIES[sKey].color;
+      const yDom = y.domain();
+      const yMinB = yDom[0], yMaxB = yDom[1];
+      const yBins = 40;
+      const binH = (yMaxB - yMinB) / yBins;
+      // Build [hand_bin][bankroll_bin] count grid.
+      let maxCount = 0;
+      const cellW = (x(c[1].hand) - x(c[0].hand));
+      for (const pt of c) {
+        const counts = new Array(yBins).fill(0);
+        for (const br of (pt.brs || [])) {
+          const idx = Math.max(0, Math.min(yBins-1, Math.floor((br - yMinB) / binH)));
+          counts[idx]++;
+        }
+        for (let i = 0; i < yBins; i++) {
+          if (counts[i] === 0) continue;
+          if (counts[i] > maxCount) maxCount = counts[i];
+        }
+        pt._counts = counts;
+      }
+      // Render rects.
+      for (const pt of c) {
+        for (let i = 0; i < yBins; i++) {
+          const cnt = pt._counts[i];
+          if (cnt === 0) continue;
+          const opacity = 0.15 + 0.85 * (cnt / maxCount);
+          svg.append("rect")
+            .attr("x", x(pt.hand) - cellW/2).attr("y", y(yMinB + (i+1)*binH))
+            .attr("width", cellW).attr("height", y(yMinB) - y(yMinB + binH))
+            .attr("fill", col).attr("opacity", opacity);
+        }
+      }
+      // Median line on top of heatmap (white for contrast against any color).
+      const line = d3.line().x(d=>x(d.hand)).y(d=>y(d.median)).curve(d3.curveMonotoneX);
+      svg.append("path").datum(c).attr("d",line).attr("fill","none")
+        .attr("stroke", "#fff").attr("stroke-width", 1.6).attr("opacity", 0.85);
+      // Start-bankroll reference (gold dash).
+      svg.append("line").attr("x1",0).attr("x2",width)
+        .attr("y1",y(state.sim.bankroll)).attr("y2",y(state.sim.bankroll))
+        .attr("stroke","#d4a843").attr("stroke-dasharray","6,4").attr("stroke-width",1).attr("opacity",0.55);
+      // Density legend.
+      svg.append("text").attr("x", width-6).attr("y", 13).attr("text-anchor","end")
+        .attr("font-family","var(--font-mono)").attr("font-size",10).attr("fill", col)
+        .text(`${STRATEGIES[sKey].name} · density of ${state.sim.sims} paths · brighter = more`);
     }
-    const line=d3.line().x(d=>x(d.hand)).y(d=>y(d.median)).curve(d3.curveMonotoneX);
-    const path=svg.append("path").datum(c).attr("d",line).attr("fill","none").attr("stroke",col).attr("stroke-width",2.5);
-    const totalLen=path.node().getTotalLength();
-    path.attr("stroke-dasharray",totalLen).attr("stroke-dashoffset",totalLen)
-      .transition().duration(1200).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
+  } else {
+    // ── Band mode (default): median + P5/P95 ribbon + EV line per strategy ──
+    // EV line: startB + ev_per_hand × hand. This is the realized AVERAGE
+    // trajectory under linearity. The gap between this line and the median
+    // curve is precisely the variance + skew story.
+    for(const sKey of keys){
+      const col=STRATEGIES[sKey].color;
+      const c=state.results[sKey].summary.curves;
+      const summary=state.results[sKey].summary;
+      if(state.sim.sims>1){
+        const area=d3.area().x(d=>x(d.hand)).y0(d=>y(d.p5)).y1(d=>y(d.p95)).curve(d3.curveMonotoneX);
+        svg.append("path").datum(c).attr("d",area).attr("fill",col).attr("opacity",0.12);
+      }
+      const line=d3.line().x(d=>x(d.hand)).y(d=>y(d.median)).curve(d3.curveMonotoneX);
+      const path=svg.append("path").datum(c).attr("d",line).attr("fill","none").attr("stroke",col).attr("stroke-width",2.5);
+      const totalLen=path.node().getTotalLength();
+      path.attr("stroke-dasharray",totalLen).attr("stroke-dashoffset",totalLen)
+        .transition().duration(1200).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
+      // Thin straight EV line in the same color.
+      const evPerHand=summary.ev_per_hand||0;
+      const evData=[{hand:0, ev:state.sim.bankroll}, {hand:xMax, ev:state.sim.bankroll + evPerHand*xMax}];
+      const evLine=d3.line().x(d=>x(d.hand)).y(d=>y(d.ev));
+      svg.append("path").datum(evData).attr("d",evLine).attr("fill","none")
+        .attr("stroke",col).attr("stroke-width",1.2)
+        .attr("stroke-dasharray","4,3").attr("opacity",0.55);
+    }
   }
 
   // ── Pinned overlay: dotted ghost line per strategy from the prior snapshot ──
@@ -1606,6 +1809,7 @@ function renderBankroll(){
     legend.innerHTML+=`<div class="legend-item"><div class="legend-swatch" style="background:${STRATEGIES[sKey].color}"></div>${STRATEGIES[sKey].name}</div>`;
   }
   legend.innerHTML+=`<div class="legend-item" style="color:#888"><div class="legend-swatch" style="background:#888;opacity:0.3"></div>P5–P95 band</div>`;
+  legend.innerHTML+=`<div class="legend-item" style="color:#888"><div class="legend-swatch" style="background-image:repeating-linear-gradient(90deg,#888 0,#888 4px,transparent 4px,transparent 7px);height:2px;width:18px;border-radius:0"></div>Realized EV line (gap to median = variance + skew)</div>`;
   wrap.appendChild(legend);
 }
 
@@ -2102,6 +2306,7 @@ function renderStats(){
     <th>Median${infoIcon("median")}</th>
     <th>Mean</th>
     <th>EV/Hand${infoIcon("ev_per_hand")}</th>
+    <th>ROR${infoIcon("ror")}</th>
     <th>Std Dev${infoIcon("std")}</th>
     <th>P5${infoIcon("p5_p95")}</th>
     <th>P95</th>
@@ -2142,6 +2347,10 @@ function renderStats(){
       <td style="color:${medColor};font-weight:700">${fmtK(s.median)}</td>
       <td>${fmtK(s.mean)} ${meanRoiSuffix}</td>
       <td style="color:${(s.ev_per_hand||0)>=0?"var(--green)":"var(--red)"}">${(s.ev_per_hand||0)>=0?"+":""}$${(s.ev_per_hand||0).toFixed(3)}</td>
+      <td style="color:${(s.return_on_risk||0)>=0?"var(--green)":"var(--red)"}">
+        <div style="font-weight:700">${(s.return_on_risk||0)>=0?"+":""}${((s.return_on_risk||0)*100).toFixed(2)}%</div>
+        <div style="font:9px var(--font-mono);color:#666">wagered ${fmtK(s.avg_total_wagered||0)}</div>
+      </td>
       <td>${fmtK(s.std)}</td>
       <td style="color:#ef535088">${fmtK(s.p5)}</td>
       <td style="color:#66bb6a88">${fmtK(s.p95)}</td>
@@ -2166,7 +2375,7 @@ function renderStats(){
         const c=pl>=0?"var(--green)":"var(--red)";
         return `<span style="color:${m2.color};font-weight:700">${m2.label}</span> <span style="color:${c}">${pl>=0?"+":"-"}${fmtK(Math.abs(pl))}</span>`;
       };
-      html+=`<tr><td colspan="11" style="padding:4px 10px 14px;font:11px var(--font-mono);color:#777;border-bottom:1px solid var(--border)">
+      html+=`<tr><td colspan="12" style="padding:4px 10px 14px;font:11px var(--font-mono);color:#777;border-bottom:1px solid var(--border)">
         ↳ Avg P/L contribution: ${cell("spotter")} &nbsp;·&nbsp; ${cell("controller")} &nbsp;·&nbsp; ${cell("big_player")} &nbsp;·&nbsp;
         BP play rate: <span style="color:${MIT_ROLE_META.big_player.color};font-weight:700">${((s.avg_bp_play_rate||0)*100).toFixed(1)}%</span>
       </td></tr>`;
@@ -2974,6 +3183,10 @@ const INFO_ENTRIES = {
                      short:"After a win, increase bet by 1 unit. After a loss, hold the bet. Target: profit of exactly +1 unit per cycle. Slow grinder, vulnerable to long downswings." },
   hilo:            { title:"Hi-Lo Card Counting",
                      short:"Tag cards 2-6 as +1, 10-A as -1. Convert the running count to a 'true count' by dividing by remaining decks. Bet bigger when TC is positive (more tens left = better player odds)." },
+  kelly:           { title:"Kelly Criterion (Hi-Lo)",
+                     short:"Mathematically optimal bet sizing: bet ≈ bankroll × edge / variance. Maximises long-run growth rate. Uses Hi-Lo true count to estimate edge (≈0.5% per TC over 1) and divides by BJ variance (≈1.3). Either over- or under-betting relative to Kelly costs growth." },
+  half_kelly:      { title:"Half Kelly",
+                     short:"Bets half of full Kelly. Cuts long-run growth by ~25% but cuts variance by ~50%. The compromise most counters actually use — the volatility of full Kelly is rough to live through even though it's mathematically optimal." },
   hilo_cheat:      { title:"Hi-Lo Cheat",
                      short:"Same idea as Hi-Lo, but reads the EXACT true count off remaining cards instead of mentally tallying. Approximates a perfect counter with no mistakes — UNREALISTIC, included as a ceiling reference." },
   mit_team:        { title:"MIT Team",
@@ -2989,6 +3202,8 @@ const INFO_ENTRIES = {
                      short:"50th-percentile final bankroll. More robust than the mean for heavy-tailed strategies (Martingale, Paroli) where rare big wins drag the mean above zero while most runs ended in ruin." },
   ev_per_hand:     { title:"EV / Hand",
                      short:"Average profit per INTENDED hand (denominator = num_sims × num_hands). Using intended hands rather than played hands keeps strategies comparable: an early-ruin strategy doesn't get its losses divided by a tiny denominator and look better than it is." },
+  ror:             { title:"Return on Risk",
+                     short:"Total profit divided by total dollars WAGERED across all sims. Normalises for exposure — a martingale that bets 30× more capital than flat for similar P/L has dramatically worse ROR. The single best apples-to-apples comparison number. Negative ROR = you lost X cents per dollar you put on the table." },
   std:             { title:"Std Dev",
                      short:"Standard deviation of final bankrolls. High values mean the strategy's outcomes are spread out — even when median is good, a high std means individual sessions can swing widely." },
   p5_p95:          { title:"P5 / P95",
@@ -3001,7 +3216,7 @@ const INFO_ENTRIES = {
                      short:"GREEN: profit chance > 50%, median > start, ruin < 10%. AMBER: mixed signals. RED: ruin ≥ 25% OR median ≤ start OR drawdown ≥ 75%." },
   // ── Chart concepts ───────────────────────────────────────────────────────
   bankroll_chart:  { title:"Bankroll Chart",
-                     short:"Median bankroll over time per strategy. Shaded band shows the P5–P95 percentile spread across all sims. Tooltip shows X/N sims still alive — when N drops below half, the median is conditioned on survivors only (survivor bias)." },
+                     short:"Median bankroll over time per strategy. Shaded band shows the P5–P95 percentile spread across all sims. Thin dashed line per strategy is the realized EV trajectory (startB + ev_per_hand × hand) — the gap between this and the median is variance + skew. Tooltip shows X/N sims still alive — when N drops below half, the median is conditioned on survivors only (survivor bias)." },
   survival_chart:  { title:"Survival Curve",
                      short:"Percent of sims still able to play at hand H. A steep drop tells you the strategy collapses early; a flat line at 100% means everyone survived to the end." },
   profit_chart:    { title:"Profit Probability Curve",
@@ -3018,6 +3233,8 @@ const INFO_ENTRIES = {
                      short:"Single team-bankroll line in Big Player color, shown for the run whose final is closest to the median. Hover for per-role cumulative P/L breakdown — Spotter, Controller, Big Player." },
   sweep:           { title:"Hyperparameter Sweep",
                      short:"Run the same strategy across a range of one parameter (decks, table-max, bankroll, etc.), holding the rest steady. Every other setting comes from your sidebar at the moment you hit RUN SWEEP." },
+  scenarios:       { title:"Scenarios",
+                     short:"Real-world story simulator. Each preset is a complete setup (bankroll + table + strategy + hands) like 'The $10 Doubler' or 'Friday Night Recreational'. Two output modes: 500-sim distribution (probability gauges + outcome histogram for 'what's likely') and Single Annotated Run (one trajectory with peak/trough/ruin annotated, ready to screenshot for a writeup)." },
 };
 
 // Render a hover-able info icon. `key` must exist in INFO_ENTRIES.
@@ -3101,6 +3318,14 @@ function renderInfo(){
         "Every card seen contributes ±1 to a running count: 2-6 are +1, 7-9 are 0, 10-A are -1. Convert running → true count by dividing by remaining decks. Bet table min when TC ≤ +1; ramp up to 2× / 4× / 8× / 12× as TC climbs. The intuition: high TC means lots of tens and aces left, which favors the player (more dealer busts, more blackjacks).",
         "Mathematically sound. Real-world implementation requires perfect mental tracking and table conditions where casinos won't notice the bet ramping.")}
 
+      ${stratCard("kelly",
+        "The mathematically optimal sizing formula: bet ≈ bankroll × edge / variance. For blackjack with Hi-Lo, that means bet = bankroll × max(0, TC − 1) × 0.005 / 1.3 (the 0.5%-per-TC heuristic for edge, 1.3 for blackjack variance). Floored at table min so you can stay seated, capped at table max and current bankroll. Any other bet sizing is provably suboptimal — Flat under-bets when the count is hot, Martingale wildly over-bets relative to edge. Kelly is the reference point everything else can be measured against.",
+        "Maximises long-run geometric growth. In practice the variance is brutal — drawdowns of 50% are routine even for a counter with positive EV.")}
+
+      ${stratCard("half_kelly",
+        "Bet exactly half of what full Kelly would call for. Mathematically: cuts long-run growth rate by ~25%, cuts variance by ~50%. The trade is overwhelmingly favorable for any human who has to live through the swings. Most published counting literature recommends half-Kelly or even quarter-Kelly as the practical choice.",
+        "The 'real-world' Kelly. Smoother ride at a small growth cost.")}
+
       ${stratCard("hilo_cheat",
         "Same betting ramp as Hi-Lo, but the engine reads the exact true count off the remaining shoe instead of relying on a player's mental count. This approximates a perfect counter with zero miscounts and zero count-loss from missed cards. Marked 'Cheating / invalid' in the stats — included only as an upper-bound reference for what perfect counting could achieve.",
         "Use this strategy's results as a ceiling, not a goal.")}
@@ -3119,6 +3344,7 @@ function renderInfo(){
         ${glossEntry("wilson", "95% confidence interval around a proportion (Ruin or Profit). With only 50 sims, an observed 8% ruin rate is statistically consistent with anywhere from ~3% to ~19% true ruin. The interval is asymmetric near 0% and 100% — that's why it's bracketed [lo, hi] not ±.")}
         ${glossEntry("median", "50th-percentile final bankroll. We lead with median (not mean) for heavy-tailed strategies where rare big wins drag the mean above zero while most runs ended in ruin. Mean is shown alongside in parentheses with ROI.")}
         ${glossEntry("ev_per_hand", "Average profit per INTENDED hand (denominator = num_sims × num_hands). Critical: using intended hands rather than played hands keeps strategies comparable. Otherwise a martingale that ruins at hand 5 with -$5,000 gets divided by ~5 instead of ~2,000, producing a misleadingly large per-hand number.")}
+        ${glossEntry("ror", "Total profit ÷ total dollars wagered across all sims. The single best apples-to-apples comparison number because it normalises for capital exposure. A flat-bet strategy and a martingale might end up with similar absolute P/L, but the martingale put 30× more dollars through the table to get there — its ROR is dramatically worse. The Stats cell also shows average dollars wagered underneath, so you can see how much action each strategy actually generates.")}
         ${glossEntry("std", "Standard deviation of final bankrolls. High values mean outcomes are spread out — even when median is good, a high std means individual sessions can swing widely.")}
         ${glossEntry("p5_p95", "5th and 95th percentile final bankrolls — 90% of sims fell between them. Stable estimators of the realistic outcome range. We show these instead of Min/Max because Min/Max are dominated by single outliers in 50-sim runs.")}
         ${glossEntry("max_dd", "Maximum drawdown — largest % decline from a running peak bankroll within one sim. Headline value is the MEDIAN across sims (the typical experience). The smaller mean number underneath is dragged toward 100% by early-ruin runs.")}
@@ -3387,6 +3613,544 @@ function maybeAutoStartTour(){
       startTour();
     }, 250);
   } catch (e) { /* localStorage unavailable — skip auto-start */ }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SCENARIO TAB  —  real-world story simulator with preset narratives
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Each preset is a complete story: bankroll + table conditions + strategy +
+// hands. Clicking a preset loads it into the scenario config (which is
+// independent from the main sidebar settings — scenarios don't touch
+// state.settings). The user can also tweak the config inline.
+//
+// Output modes:
+//   "distribution" — run 500 sims of this scenario, show outcome histogram
+//                    and headline probability gauges (P(profit), P(ruin) etc.)
+//   "single_run"   — one specific simulated trajectory with notable events
+//                    annotated for narrative writeups.
+//
+// The simulate() / simulateMitTeam() engine reads from state.settings and
+// state.sim, so we briefly mutate those, run, then restore — the same
+// pattern the Sweep tab uses.
+
+const SCENARIO_PRESETS = [
+  {
+    id: "doubler_10",
+    title: "The $10 Doubler",
+    blurb: "I walk into a casino with $10 in my pocket, find a $5 table, and double after every loss. Classic 'system' story.",
+    strategy: "martingale",
+    settings: { bankroll:10, tableMin:5, tableMax:5000, decks:6, penetration:75, bjPays:"3:2" },
+    hands: 50,
+  },
+  {
+    id: "friday_night",
+    title: "Friday Night Recreational",
+    blurb: "$200 in pocket, $25 table, flat bet, 90 minutes of play (~120 hands). The 'casual evening out' player.",
+    strategy: "flat",
+    settings: { bankroll:200, tableMin:25, tableMax:5000, decks:6, penetration:75, bjPays:"3:2" },
+    hands: 120,
+  },
+  {
+    id: "martingale_chase",
+    title: "The Martingale Chase",
+    blurb: "$500 buy-in at a $25 table with a $1k max bet. 'I'll always make my money back.' Watch the table-max wall in action.",
+    strategy: "martingale",
+    settings: { bankroll:500, tableMin:25, tableMax:1000, decks:6, penetration:75, bjPays:"3:2" },
+    hands: 200,
+  },
+  {
+    id: "dalembert_grind",
+    title: "The D'Alembert Grinder",
+    blurb: "$500, $25 table, raise after losses but only +1 unit. Bleeds slower than martingale, dies less catastrophically.",
+    strategy: "dalembert",
+    settings: { bankroll:500, tableMin:25, tableMax:5000, decks:6, penetration:75, bjPays:"3:2" },
+    hands: 200,
+  },
+  {
+    id: "six_five_sucker",
+    title: "The 6:5 Sucker Bet",
+    blurb: "$500 bankroll, $15 6:5 table, flat bet for 200 hands. The casino's most lucrative recent rule change.",
+    strategy: "flat",
+    settings: { bankroll:500, tableMin:15, tableMax:5000, decks:6, penetration:75, bjPays:"6:5" },
+    hands: 200,
+  },
+  {
+    id: "counter_trip",
+    title: "The Counter's Trip",
+    blurb: "$2,000 bankroll, $25 table, Hi-Lo counting, 500 hands across a weekend. The 'I read a book' player.",
+    strategy: "hilo",
+    settings: { bankroll:2000, tableMin:25, tableMax:5000, decks:6, penetration:75, bjPays:"3:2" },
+    hands: 500,
+  },
+  {
+    id: "kelly_disciplined",
+    title: "The Disciplined Kelly",
+    blurb: "$5,000 bankroll, $25 table, half-Kelly sizing on Hi-Lo count. Mathematically optimal compromise.",
+    strategy: "half_kelly",
+    settings: { bankroll:5000, tableMin:25, tableMax:5000, decks:6, penetration:75, bjPays:"3:2" },
+    hands: 500,
+  },
+  {
+    id: "high_roller",
+    title: "The High Roller's Night",
+    blurb: "$25,000 buy-in, $500 minimum, 100 hands. Big bets, big swings, single session.",
+    strategy: "flat",
+    settings: { bankroll:25000, tableMin:500, tableMax:25000, decks:6, penetration:75, bjPays:"3:2" },
+    hands: 100,
+  },
+  {
+    id: "mit_run",
+    title: "The MIT Team Run",
+    blurb: "$50,000 team bankroll, $50 minimum, 1,000 hands. Three-actor team play scenario.",
+    strategy: "mit_team",
+    settings: { bankroll:50000, tableMin:50, tableMax:5000, decks:6, penetration:75, bjPays:"3:2" },
+    hands: 1000,
+  },
+];
+
+// Persistent across renders so the user's last-picked scenario sticks.
+state.scenario = {
+  preset: null,
+  // Active config — populated when a preset is clicked, editable inline.
+  config: null,
+  output: "distribution",       // "distribution" | "single_run"
+  result: null,                 // last run's data { sims, finals, ... }
+  running: false,
+};
+
+// Run N sims of the current scenario WITHOUT touching state.settings/sim
+// permanently. Returns aggregate data for the chosen output mode.
+function runScenario(scenario, nSims, captureFirstRun){
+  // Save originals.
+  const orig = {
+    decks:state.settings.decks, penetration:state.settings.penetration,
+    tableMin:state.settings.tableMin, tableMax:state.settings.tableMax,
+    bjPays:state.settings.bjPays, dealerS17:state.settings.dealerS17,
+    bankroll:state.sim.bankroll, hands:state.sim.hands, sims:state.sim.sims,
+  };
+  // Mutate for the scenario.
+  Object.assign(state.settings, scenario.settings);
+  state.sim.bankroll = scenario.settings.bankroll;
+  state.sim.hands = scenario.hands;
+  state.sim.sims = nSims;
+  // Run.
+  const sims = [];
+  let firstRun = null;
+  for (let i = 0; i < nSims; i++) {
+    const r = simulate(scenario.strategy, captureFirstRun && i === 0);
+    if (captureFirstRun && i === 0) firstRun = r;
+    sims.push(r);
+  }
+  // Restore.
+  Object.assign(state.settings, {
+    decks:orig.decks, penetration:orig.penetration,
+    tableMin:orig.tableMin, tableMax:orig.tableMax,
+    bjPays:orig.bjPays, dealerS17:orig.dealerS17,
+  });
+  state.sim.bankroll = orig.bankroll;
+  state.sim.hands = orig.hands;
+  state.sim.sims = orig.sims;
+  // Aggregate.
+  const finals = sims.map(s => s.final_bankroll).sort((a,b)=>a-b);
+  const n = finals.length;
+  const startB = scenario.settings.bankroll;
+  const ruined = sims.filter(s => s.ruined).length;
+  const profit = sims.filter(s => s.final_bankroll > startB).length;
+  const breakEven = sims.filter(s => s.final_bankroll === startB).length;
+  const totalWag = sims.reduce((a,s)=>a+(s.total_wagered||0),0);
+  const totalProfit = finals.reduce((a,f)=>a+(f-startB),0);
+  return {
+    sims, firstRun, finals, n,
+    median: finals[Math.floor(n/2)],
+    mean: finals.reduce((a,f)=>a+f,0)/n,
+    p5: finals[Math.max(0, Math.floor(n*0.05))],
+    p95: finals[Math.min(n-1, Math.floor(n*0.95))],
+    min: finals[0], max: finals[n-1],
+    ruin_count: ruined,
+    profit_count: profit,
+    breakeven_count: breakEven,
+    loss_count: n - ruined - profit - breakEven,
+    total_wagered: totalWag,
+    total_profit: totalProfit,
+    ror: totalWag > 0 ? totalProfit / totalWag : 0,
+    avg_hands: sims.reduce((a,s)=>a+(s.hands_played||scenario.hands),0)/n,
+  };
+}
+
+function renderScenarios(){
+  const container = document.getElementById("view-scenarios");
+  container.innerHTML = "";
+  const doc = document.createElement("div");
+  doc.style.cssText = "max-width:1100px;margin:0 auto;";
+  container.appendChild(doc);
+
+  // ── Preset library ──
+  const presetsWrap = document.createElement("div");
+  presetsWrap.className = "chart-container";
+  presetsWrap.style.cssText = "margin-bottom:14px;padding:14px 16px;";
+  presetsWrap.innerHTML = `<div class="chart-header"><span class="chart-label">SCENARIO PRESETS</span><span class="chart-label">PICK A STORY, RUN IT, WRITE ABOUT IT</span></div>`;
+  doc.appendChild(presetsWrap);
+  const grid = document.createElement("div");
+  grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;margin-top:10px;";
+  presetsWrap.appendChild(grid);
+  for (const p of SCENARIO_PRESETS) {
+    const card = document.createElement("button");
+    const isActive = state.scenario.preset === p.id;
+    card.style.cssText = `text-align:left;background:${isActive?'var(--gold-dim)':'var(--bg-elevated)'};border:1px solid ${isActive?'var(--gold)':'var(--border)'};border-radius:5px;padding:11px 13px;cursor:pointer;color:var(--text-primary);transition:all 0.12s;font-family:var(--font-sans);`;
+    card.innerHTML = `
+      <div style="font:700 12px var(--font-mono);color:${isActive?'var(--gold)':'var(--text-primary)'};letter-spacing:0.5px;margin-bottom:4px;">${p.title}</div>
+      <div style="font:11.5px var(--font-sans);color:var(--text-secondary);line-height:1.45;">${p.blurb}</div>
+      <div style="font:10px var(--font-mono);color:var(--text-muted);margin-top:6px;letter-spacing:0.4px;">${STRATEGIES[p.strategy]?.name||p.strategy} · $${p.settings.bankroll.toLocaleString()} · $${p.settings.tableMin} min · ${p.hands}h · ${p.settings.bjPays}</div>
+    `;
+    card.onclick = () => {
+      state.scenario.preset = p.id;
+      state.scenario.config = JSON.parse(JSON.stringify(p));   // editable copy
+      state.scenario.result = null;
+      renderScenarios();
+    };
+    card.onmouseenter = () => { if(!isActive){ card.style.borderColor="var(--border-hover)"; }};
+    card.onmouseleave = () => { if(!isActive){ card.style.borderColor="var(--border)"; }};
+    grid.appendChild(card);
+  }
+
+  if (!state.scenario.config) {
+    const hint = document.createElement("div");
+    hint.style.cssText = "text-align:center;padding:30px 20px;color:var(--text-muted);font:12px var(--font-mono);";
+    hint.innerHTML = `Pick a scenario above to load it. Each one is a real-world story — bankroll, table, strategy, hand count are all pre-set. Run it, screenshot the chart, write about it.`;
+    doc.appendChild(hint);
+    return;
+  }
+
+  // ── Editable config ──
+  const cfg = state.scenario.config;
+  const cfgWrap = document.createElement("div");
+  cfgWrap.className = "chart-container";
+  cfgWrap.style.cssText = "margin-bottom:14px;padding:14px 16px;";
+  cfgWrap.innerHTML = `<div class="chart-header"><span class="chart-label">${cfg.title.toUpperCase()}</span><span class="chart-label">TWEAK THE CONFIG, RUN AGAIN</span></div>
+    <div style="font:13px var(--font-sans);color:var(--text-secondary);margin:8px 0 12px;line-height:1.5;">${cfg.blurb}</div>`;
+  doc.appendChild(cfgWrap);
+  const cfgGrid = document.createElement("div");
+  cfgGrid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;";
+  cfgWrap.appendChild(cfgGrid);
+  const numericInputs = [
+    {label:"Bankroll", get:()=>cfg.settings.bankroll, set:v=>{cfg.settings.bankroll=v;}, fmt:v=>`$${v.toLocaleString()}`},
+    {label:"Table min", get:()=>cfg.settings.tableMin, set:v=>{cfg.settings.tableMin=v;}, fmt:v=>`$${v}`},
+    {label:"Table max", get:()=>cfg.settings.tableMax, set:v=>{cfg.settings.tableMax=v;}, fmt:v=>`$${v.toLocaleString()}`},
+    {label:"Decks", get:()=>cfg.settings.decks, set:v=>{cfg.settings.decks=v;}, fmt:v=>`${v}d`},
+    {label:"Penetration", get:()=>cfg.settings.penetration, set:v=>{cfg.settings.penetration=v;}, fmt:v=>`${v}%`},
+    {label:"Hands", get:()=>cfg.hands, set:v=>{cfg.hands=v;}, fmt:v=>v.toLocaleString()},
+  ];
+  for (const inp of numericInputs) {
+    const b = document.createElement("div");
+    b.innerHTML = `<div style="font:10px var(--font-mono);color:var(--text-muted);letter-spacing:0.5px;margin-bottom:4px;">${inp.label.toUpperCase()}</div>
+      <input type="number" value="${inp.get()}" style="width:100%;padding:6px 8px;background:var(--bg-elevated);border:1px solid var(--border);color:var(--text-primary);font:12px var(--font-mono);border-radius:4px;">`;
+    const i = b.querySelector("input");
+    i.onchange = () => { inp.set(+i.value); state.scenario.result = null; };
+    cfgGrid.appendChild(b);
+  }
+  // Strategy selector
+  const stratBlock = document.createElement("div");
+  stratBlock.innerHTML = `<div style="font:10px var(--font-mono);color:var(--text-muted);letter-spacing:0.5px;margin-bottom:4px;">STRATEGY</div>`;
+  const sel = document.createElement("select");
+  sel.style.cssText = "width:100%;padding:6px 8px;background:var(--bg-elevated);border:1px solid var(--border);color:var(--text-primary);font:12px var(--font-mono);border-radius:4px;";
+  for (const sk in STRATEGIES) {
+    const opt = document.createElement("option");
+    opt.value = sk; opt.textContent = STRATEGIES[sk].name;
+    if (sk === cfg.strategy) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.onchange = () => { cfg.strategy = sel.value; state.scenario.result = null; renderScenarios(); };
+  stratBlock.appendChild(sel);
+  cfgGrid.appendChild(stratBlock);
+  // BJ Pays selector
+  const bjBlock = document.createElement("div");
+  bjBlock.innerHTML = `<div style="font:10px var(--font-mono);color:var(--text-muted);letter-spacing:0.5px;margin-bottom:4px;">BJ PAYS</div>`;
+  const bjSel = document.createElement("select");
+  bjSel.style.cssText = sel.style.cssText;
+  for (const v of ["3:2","6:5"]) {
+    const opt = document.createElement("option");
+    opt.value = v; opt.textContent = v;
+    if (v === cfg.settings.bjPays) opt.selected = true;
+    bjSel.appendChild(opt);
+  }
+  bjSel.onchange = () => { cfg.settings.bjPays = bjSel.value; state.scenario.result = null; };
+  bjBlock.appendChild(bjSel);
+  cfgGrid.appendChild(bjBlock);
+
+  // ── Run controls + output-mode toggle ──
+  const controls = document.createElement("div");
+  controls.style.cssText = "display:flex;align-items:center;gap:10px;margin-top:14px;";
+  cfgWrap.appendChild(controls);
+  const modeWrap = document.createElement("div");
+  modeWrap.style.cssText = "display:flex;gap:6px;";
+  for (const m of [{k:"distribution",l:"500-sim distribution"},{k:"single_run",l:"Single annotated run"}]) {
+    const b = document.createElement("button");
+    const isActive = state.scenario.output === m.k;
+    b.style.cssText = `padding:6px 10px;background:${isActive?'var(--gold-dim)':'transparent'};border:1px solid ${isActive?'var(--gold)':'var(--border)'};color:${isActive?'var(--gold)':'var(--text-secondary)'};font:11px var(--font-mono);border-radius:4px;cursor:pointer;letter-spacing:0.3px;`;
+    b.textContent = m.l;
+    b.onclick = () => { state.scenario.output = m.k; renderScenarios(); };
+    modeWrap.appendChild(b);
+  }
+  controls.appendChild(modeWrap);
+  const spacer = document.createElement("div");
+  spacer.style.flex = "1";
+  controls.appendChild(spacer);
+  const runBtn = document.createElement("button");
+  runBtn.className = "btn btn-gold";
+  runBtn.textContent = state.scenario.running ? "RUNNING..." : "RUN SCENARIO";
+  runBtn.disabled = state.scenario.running;
+  runBtn.onclick = () => {
+    state.scenario.running = true;
+    renderScenarios();
+    setTimeout(() => {
+      const nSims = state.scenario.output === "single_run" ? 1 : 500;
+      state.scenario.result = runScenario(cfg, nSims, true);
+      state.scenario.running = false;
+      renderScenarios();
+    }, 30);
+  };
+  controls.appendChild(runBtn);
+
+  // ── Output ──
+  if (!state.scenario.result) {
+    const hint = document.createElement("div");
+    hint.style.cssText = "text-align:center;padding:30px 20px;color:var(--text-muted);font:12px var(--font-mono);";
+    hint.innerHTML = `Hit RUN SCENARIO to simulate. <br><span style="opacity:0.7">500-sim distribution gives you the 'what's likely' picture; single-run shows one specific story you can annotate.</span>`;
+    doc.appendChild(hint);
+    return;
+  }
+
+  if (state.scenario.output === "distribution") {
+    renderScenarioDistribution(doc, cfg, state.scenario.result);
+  } else {
+    renderScenarioSingleRun(doc, cfg, state.scenario.result);
+  }
+}
+
+function renderScenarioDistribution(parent, cfg, r){
+  // ── Probability gauges ──
+  const gaugesWrap = document.createElement("div");
+  gaugesWrap.className = "chart-container";
+  gaugesWrap.style.cssText = "margin-bottom:14px;padding:14px 16px;";
+  gaugesWrap.innerHTML = `<div class="chart-header"><span class="chart-label">HEADLINE PROBABILITIES</span><span class="chart-label">${r.n.toLocaleString()} SIMS · ${cfg.hands.toLocaleString()} HANDS EACH</span></div>`;
+  parent.appendChild(gaugesWrap);
+  const gaugeGrid = document.createElement("div");
+  gaugeGrid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:10px;";
+  gaugesWrap.appendChild(gaugeGrid);
+  const startB = cfg.settings.bankroll;
+  const gauges = [
+    { label:"Walked away UP", pct: r.profit_count/r.n*100, color:"#66bb6a" },
+    { label:"Walked away DOWN", pct: r.loss_count/r.n*100, color:"#bcaaa4" },
+    { label:"Got RUINED", pct: r.ruin_count/r.n*100, color:"#ef5350" },
+    { label:"Walked away EVEN", pct: r.breakeven_count/r.n*100, color:"#90a4ae" },
+  ];
+  for (const g of gauges) {
+    const cell = document.createElement("div");
+    cell.style.cssText = `background:var(--bg-elevated);border-radius:6px;padding:14px;border-left:4px solid ${g.color};`;
+    cell.innerHTML = `
+      <div style="font:600 10px var(--font-mono);color:${g.color};letter-spacing:1px;text-transform:uppercase;">${g.label}</div>
+      <div style="font:700 28px var(--font-mono);color:${g.color};margin-top:6px;">${g.pct.toFixed(1)}%</div>
+    `;
+    gaugeGrid.appendChild(cell);
+  }
+  // Headline summary row.
+  const meta = document.createElement("div");
+  meta.style.cssText = "font:12px var(--font-mono);color:var(--text-secondary);margin-top:14px;line-height:1.6;";
+  const medianDelta = r.median - startB;
+  const meanDelta = r.mean - startB;
+  meta.innerHTML = `
+    Median outcome: <b style="color:${medianDelta>=0?'#66bb6a':'#ef5350'}">${fmt$(r.median)}</b> (${medianDelta>=0?'+':''}${fmt$(medianDelta,{signed:true})} vs start) ·
+    Mean: <b style="color:${meanDelta>=0?'#66bb6a':'#ef5350'}">${fmt$(r.mean)}</b> ·
+    P5–P95 range: <b>${fmt$(r.p5)} → ${fmt$(r.p95)}</b><br>
+    Avg dollars wagered per sim: <b>${fmt$(r.total_wagered/r.n)}</b> ·
+    Return on Risk: <b style="color:${r.ror>=0?'#66bb6a':'#ef5350'}">${(r.ror*100).toFixed(2)}%</b> ·
+    Avg session length: <b>${Math.round(r.avg_hands).toLocaleString()}</b> of ${cfg.hands.toLocaleString()} planned hands
+  `;
+  gaugesWrap.appendChild(meta);
+
+  // ── Outcome distribution histogram ──
+  const histWrap = document.createElement("div");
+  histWrap.className = "chart-container";
+  histWrap.innerHTML = `<div class="chart-header"><span class="chart-label">OUTCOME DISTRIBUTION</span><span class="chart-label">EACH BAR = X SIMS LANDING IN THAT $ RANGE</span></div>`;
+  parent.appendChild(histWrap);
+  // 30-bin histogram from min to max, with start-bankroll reference line.
+  const finals = r.finals;
+  const min = Math.min(finals[0], startB);
+  const max = Math.max(finals[finals.length-1], startB);
+  const nBins = 30;
+  const binWidth = (max - min) / nBins || 1;
+  const bins = new Array(nBins).fill(0);
+  for (const f of finals) {
+    const idx = Math.max(0, Math.min(nBins-1, Math.floor((f - min) / binWidth)));
+    bins[idx]++;
+  }
+  const margin = {top:20,right:30,bottom:50,left:60};
+  const w = histWrap.clientWidth - margin.left - margin.right - 40;
+  const h = 240;
+  const svg = d3.select(histWrap).append("svg")
+    .attr("width", w + margin.left + margin.right)
+    .attr("height", h + margin.top + margin.bottom)
+    .append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  const xs = d3.scaleLinear().domain([min, max]).range([0, w]);
+  const ys = d3.scaleLinear().domain([0, d3.max(bins)*1.1]).range([h, 0]);
+  svg.append("g").attr("class","grid").attr("transform",`translate(0,${h})`).call(d3.axisBottom(xs).tickSize(-h).tickFormat(""));
+  svg.append("g").attr("class","grid").call(d3.axisLeft(ys).tickSize(-w).tickFormat(""));
+  svg.append("g").attr("class","axis").attr("transform",`translate(0,${h})`)
+    .call(d3.axisBottom(xs).ticks(8).tickFormat(v=>fmt$(v)));
+  svg.append("g").attr("class","axis").call(d3.axisLeft(ys).ticks(5));
+  // Bars
+  for (let i = 0; i < nBins; i++) {
+    const x0 = xs(min + i*binWidth);
+    const x1 = xs(min + (i+1)*binWidth);
+    const binCenter = min + (i+0.5)*binWidth;
+    const isProfit = binCenter > startB;
+    const isRuin = binCenter < startB*0.05;
+    const col = isRuin ? "#ef5350" : isProfit ? "#66bb6a" : "#bcaaa4";
+    svg.append("rect")
+      .attr("x", x0+1).attr("y", ys(bins[i]))
+      .attr("width", Math.max(0, x1-x0-2))
+      .attr("height", h - ys(bins[i]))
+      .attr("fill", col).attr("opacity", 0.78);
+  }
+  // Starting bankroll reference line.
+  svg.append("line").attr("x1", xs(startB)).attr("x2", xs(startB))
+    .attr("y1", 0).attr("y2", h)
+    .attr("stroke", "#d4a843").attr("stroke-dasharray", "5,4").attr("stroke-width", 1.5);
+  svg.append("text").attr("x", xs(startB)+4).attr("y", 12)
+    .attr("fill","#d4a843").attr("font-family","var(--font-mono)").attr("font-size",10)
+    .text("start: "+fmt$(startB));
+}
+
+function renderScenarioSingleRun(parent, cfg, r){
+  if (!r.firstRun || !r.firstRun.history) {
+    parent.innerHTML += `<div style="padding:20px;color:var(--text-muted);font:12px var(--font-mono);">No trajectory data available.</div>`;
+    return;
+  }
+  const run = r.firstRun;
+  const series = run.history;
+  const startB = cfg.settings.bankroll;
+
+  // ── Headline outcome ──
+  const headWrap = document.createElement("div");
+  headWrap.className = "chart-container";
+  headWrap.style.cssText = "margin-bottom:14px;padding:14px 16px;";
+  const ended = run.ruined ? "RUINED" :
+                run.stopped_loss ? "STOPPED (LOSS)" :
+                run.stopped_profit ? "STOPPED (PROFIT)" :
+                run.final_bankroll > startB ? "WALKED AWAY UP" :
+                run.final_bankroll < startB ? "WALKED AWAY DOWN" : "WALKED AWAY EVEN";
+  const col = run.ruined ? "#ef5350" : run.final_bankroll > startB ? "#66bb6a" : "#bcaaa4";
+  const delta = run.final_bankroll - startB;
+  headWrap.innerHTML = `
+    <div class="chart-header"><span class="chart-label">SINGLE RUN  ·  ${cfg.title.toUpperCase()}</span><span class="chart-label">ONE SAMPLE TRAJECTORY</span></div>
+    <div style="display:flex;gap:24px;margin-top:14px;align-items:baseline;flex-wrap:wrap;">
+      <div>
+        <div style="font:11px var(--font-mono);color:var(--text-muted);letter-spacing:1px;">OUTCOME</div>
+        <div style="font:700 22px var(--font-mono);color:${col};margin-top:4px;">${ended}</div>
+      </div>
+      <div>
+        <div style="font:11px var(--font-mono);color:var(--text-muted);letter-spacing:1px;">FINAL BANKROLL</div>
+        <div style="font:700 22px var(--font-mono);color:${col};margin-top:4px;">${fmt$(run.final_bankroll)}</div>
+      </div>
+      <div>
+        <div style="font:11px var(--font-mono);color:var(--text-muted);letter-spacing:1px;">CHANGE</div>
+        <div style="font:700 22px var(--font-mono);color:${delta>=0?'#66bb6a':'#ef5350'};margin-top:4px;">${fmt$(delta,{signed:true})}</div>
+      </div>
+      <div>
+        <div style="font:11px var(--font-mono);color:var(--text-muted);letter-spacing:1px;">HANDS PLAYED</div>
+        <div style="font:700 22px var(--font-mono);color:var(--text-primary);margin-top:4px;">${(run.hands_played||cfg.hands).toLocaleString()} <span style="font-size:13px;color:var(--text-muted);">/ ${cfg.hands.toLocaleString()} planned</span></div>
+      </div>
+      <div>
+        <div style="font:11px var(--font-mono);color:var(--text-muted);letter-spacing:1px;">TOTAL WAGERED</div>
+        <div style="font:700 22px var(--font-mono);color:var(--text-primary);margin-top:4px;">${fmt$(run.total_wagered||0)}</div>
+      </div>
+    </div>`;
+  parent.appendChild(headWrap);
+
+  // ── Trajectory chart ──
+  const chartWrap = document.createElement("div");
+  chartWrap.className = "chart-container";
+  chartWrap.innerHTML = `<div class="chart-header"><span class="chart-label">BANKROLL TRAJECTORY</span><span class="chart-label">HAND-BY-HAND</span></div>`;
+  parent.appendChild(chartWrap);
+  const margin = {top:20,right:30,bottom:40,left:65};
+  const w = chartWrap.clientWidth - margin.left - margin.right - 40;
+  const h = 320;
+  const svg = d3.select(chartWrap).append("svg")
+    .attr("width", w + margin.left + margin.right)
+    .attr("height", h + margin.top + margin.bottom)
+    .append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  const xMax = series[series.length-1].hand;
+  const yMin = Math.min(0, ...series.map(d=>d.bankroll));
+  const yMax = Math.max(startB, ...series.map(d=>d.bankroll));
+  const xs = d3.scaleLinear().domain([0, Math.max(xMax, cfg.hands)]).range([0, w]);
+  const ys = d3.scaleLinear().domain([yMin, yMax*1.08]).range([h, 0]);
+  svg.append("g").attr("class","grid").attr("transform",`translate(0,${h})`).call(d3.axisBottom(xs).tickSize(-h).tickFormat(""));
+  svg.append("g").attr("class","grid").call(d3.axisLeft(ys).tickSize(-w).tickFormat(""));
+  svg.append("g").attr("class","axis").attr("transform",`translate(0,${h})`).call(d3.axisBottom(xs).ticks(8));
+  svg.append("g").attr("class","axis").call(d3.axisLeft(ys).ticks(6).tickFormat(v=>fmt$(v)));
+  // Start-bankroll reference.
+  svg.append("line").attr("x1",0).attr("x2",w).attr("y1",ys(startB)).attr("y2",ys(startB))
+    .attr("stroke","#d4a843").attr("stroke-dasharray","6,4").attr("opacity",0.45);
+  // Bankroll line — color reflects strategy.
+  const stratCol = STRATEGIES[cfg.strategy]?.color || "#4fc3f7";
+  const line = d3.line().x(d=>xs(d.hand)).y(d=>ys(d.bankroll)).curve(d3.curveMonotoneX);
+  const path = svg.append("path").datum(series).attr("d",line).attr("fill","none").attr("stroke",stratCol).attr("stroke-width",2.5);
+  const tl = path.node().getTotalLength();
+  path.attr("stroke-dasharray",tl).attr("stroke-dashoffset",tl)
+    .transition().duration(1300).ease(d3.easeCubicOut).attr("stroke-dashoffset",0);
+  // Notable-events overlay: peak, trough, ruin point.
+  const peakIdx = series.reduce((bestI, pt, i, arr) => pt.bankroll > arr[bestI].bankroll ? i : bestI, 0);
+  const troughIdx = series.reduce((bestI, pt, i, arr) => pt.bankroll < arr[bestI].bankroll ? i : bestI, 0);
+  const peakPt = series[peakIdx];
+  const troughPt = series[troughIdx];
+  // Peak marker
+  if (peakPt.bankroll > startB) {
+    svg.append("circle").attr("cx", xs(peakPt.hand)).attr("cy", ys(peakPt.bankroll)).attr("r",5).attr("fill","#66bb6a").attr("stroke","#fff").attr("stroke-width",1.5);
+    svg.append("text").attr("x", xs(peakPt.hand)+8).attr("y", ys(peakPt.bankroll)-8)
+      .attr("fill","#66bb6a").attr("font-family","var(--font-mono)").attr("font-size",10)
+      .text(`Peak: ${fmt$(peakPt.bankroll)} @ hand ${peakPt.hand}`);
+  }
+  // Trough marker
+  if (troughPt.bankroll < startB && troughPt !== peakPt) {
+    svg.append("circle").attr("cx", xs(troughPt.hand)).attr("cy", ys(troughPt.bankroll)).attr("r",5).attr("fill","#ef5350").attr("stroke","#fff").attr("stroke-width",1.5);
+    svg.append("text").attr("x", xs(troughPt.hand)+8).attr("y", ys(troughPt.bankroll)+14)
+      .attr("fill","#ef5350").attr("font-family","var(--font-mono)").attr("font-size",10)
+      .text(`Low: ${fmt$(troughPt.bankroll)} @ hand ${troughPt.hand}`);
+  }
+  // Ruin marker
+  if (run.ruined) {
+    const lastPt = series[series.length-1];
+    svg.append("text").attr("x", xs(lastPt.hand)-5).attr("y", ys(lastPt.bankroll)-12)
+      .attr("text-anchor","end").attr("fill","#ef5350")
+      .attr("font-family","var(--font-mono)").attr("font-size",11).attr("font-weight",700)
+      .text(`⚠ RUIN @ hand ${lastPt.hand}`);
+  }
+
+  // ── Narrative annotations (peak, trough, ruin if any) ──
+  const noteWrap = document.createElement("div");
+  noteWrap.className = "chart-container";
+  noteWrap.style.cssText = "margin-top:14px;padding:14px 16px;";
+  noteWrap.innerHTML = `<div class="chart-header"><span class="chart-label">WRITEUP NOTES</span><span class="chart-label">DISCUSSION POINTS</span></div>`;
+  const notes = [];
+  notes.push(`<b>Setup:</b> ${cfg.blurb}`);
+  if (peakPt.bankroll > startB) {
+    const gain = peakPt.bankroll - startB;
+    notes.push(`Peak bankroll of <b style="color:#66bb6a">${fmt$(peakPt.bankroll)}</b> (+${fmt$(gain,{signed:true})}) reached at hand ${peakPt.hand}. Sitting out at this point would have locked in ${((gain/startB)*100).toFixed(1)}% return.`);
+  }
+  if (troughPt.bankroll < startB) {
+    const loss = startB - troughPt.bankroll;
+    notes.push(`Worst point was <b style="color:#ef5350">${fmt$(troughPt.bankroll)}</b> (-${fmt$(loss,{signed:true})}) at hand ${troughPt.hand}. The classic 'I should have walked away' moment.`);
+  }
+  if (run.ruined) {
+    notes.push(`<b style="color:#ef5350">Ruined at hand ${run.hands_played}.</b> Wagered ${fmt$(run.total_wagered||0)} total before bust — that's ${(((run.total_wagered||0)/startB)).toFixed(1)}× starting bankroll churned through the table.`);
+  } else {
+    const churnRatio = (run.total_wagered||0)/startB;
+    notes.push(`Total wagered: <b>${fmt$(run.total_wagered||0)}</b> — ${churnRatio.toFixed(1)}× your starting bankroll cycled through the table over ${run.hands_played||cfg.hands} hands.`);
+  }
+  notes.push(`<i>Note: this is ONE specific sample. Use the 500-sim distribution view above to see the full range of outcomes for this scenario.</i>`);
+  noteWrap.innerHTML += `<div style="margin-top:10px;font:13px var(--font-sans);color:var(--text-secondary);line-height:1.7;">${notes.map(n=>`<div style="margin-bottom:6px;">› ${n}</div>`).join("")}</div>`;
+  parent.appendChild(noteWrap);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
